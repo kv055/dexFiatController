@@ -27,6 +27,10 @@ go.work.sum
 # env file
 .env
 
+# Built binaries
+totp-api
+dexFiatController
+
 # Editor/IDE
 # .idea/
 # .vscode/
