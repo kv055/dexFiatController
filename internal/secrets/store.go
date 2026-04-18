@@ -18,6 +18,12 @@ type Store struct {
 	db *sql.DB
 }
 
+type Account struct {
+	Provider string
+	Email    string
+	Password string
+}
+
 func Open(databaseURL string) (*Store, error) {
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
@@ -39,9 +45,9 @@ func (s *Store) Close() error {
 
 func (s *Store) LoadActiveTOTPSecrets(ctx context.Context) (map[string]string, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT sp.provider, ts.secret
+		SELECT a.provider, ts.secret
 		FROM totp_secrets ts
-		JOIN secret_providers sp ON sp.id = ts.provider_id
+		JOIN accounts a ON a.id = ts.account_id
 		WHERE ts.is_active = TRUE
 	`)
 	if err != nil {
@@ -61,6 +67,48 @@ func (s *Store) LoadActiveTOTPSecrets(ctx context.Context) (map[string]string, e
 	return secrets, rows.Err()
 }
 
+func (s *Store) LoadAccounts(ctx context.Context) (map[string]Account, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT provider, COALESCE(email, ''), COALESCE(password, '')
+		FROM accounts
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("load accounts: %w", err)
+	}
+	defer rows.Close()
+
+	accounts := make(map[string]Account)
+	for rows.Next() {
+		var account Account
+		if err := rows.Scan(&account.Provider, &account.Email, &account.Password); err != nil {
+			return nil, fmt.Errorf("scan account: %w", err)
+		}
+		accounts[account.Provider] = account
+	}
+	return accounts, rows.Err()
+}
+
+func (s *Store) UpsertAccount(ctx context.Context, provider, email, password string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin account upsert: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := ensureAccount(ctx, tx, Account{
+		Provider: provider,
+		Email:    email,
+		Password: password,
+	}); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit account upsert for %s: %w", provider, err)
+	}
+	return nil
+}
+
 func (s *Store) UpsertTOTPSecret(ctx context.Context, provider, secret string) error {
 	if strings.TrimSpace(secret) == "" {
 		return nil
@@ -72,7 +120,7 @@ func (s *Store) UpsertTOTPSecret(ctx context.Context, provider, secret string) e
 	}
 	defer tx.Rollback()
 
-	providerID, err := ensureProvider(ctx, tx, provider)
+	accountID, err := ensureAccount(ctx, tx, Account{Provider: provider})
 	if err != nil {
 		return err
 	}
@@ -82,8 +130,8 @@ func (s *Store) UpsertTOTPSecret(ctx context.Context, provider, secret string) e
 	err = tx.QueryRowContext(ctx, `
 		SELECT id, secret
 		FROM totp_secrets
-		WHERE provider_id = $1 AND is_active = TRUE
-	`, providerID).Scan(&existingID, &existingSecret)
+		WHERE account_id = $1 AND is_active = TRUE
+	`, accountID).Scan(&existingID, &existingSecret)
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("query active totp secret for %s: %w", provider, err)
 	}
@@ -91,9 +139,9 @@ func (s *Store) UpsertTOTPSecret(ctx context.Context, provider, secret string) e
 	switch {
 	case err == sql.ErrNoRows:
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO totp_secrets (provider_id, secret, is_active)
+			INSERT INTO totp_secrets (account_id, secret, is_active)
 			VALUES ($1, $2, TRUE)
-		`, providerID, secret); err != nil {
+		`, accountID, secret); err != nil {
 			return fmt.Errorf("insert totp secret for %s: %w", provider, err)
 		}
 	case existingSecret == secret:
@@ -107,9 +155,9 @@ func (s *Store) UpsertTOTPSecret(ctx context.Context, provider, secret string) e
 			return fmt.Errorf("retire totp secret for %s: %w", provider, err)
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO totp_secrets (provider_id, secret, is_active)
+			INSERT INTO totp_secrets (account_id, secret, is_active)
 			VALUES ($1, $2, TRUE)
-		`, providerID, secret); err != nil {
+		`, accountID, secret); err != nil {
 			return fmt.Errorf("insert rotated totp secret for %s: %w", provider, err)
 		}
 	}
@@ -187,7 +235,7 @@ func (s *Store) SaveCredentials(ctx context.Context, credentials []*auth.Passkey
 	}
 
 	for _, cred := range credentials {
-		providerID, err := ensureProvider(ctx, tx, providerForRPID(cred.RPID))
+		accountID, err := ensureAccount(ctx, tx, Account{Provider: providerForRPID(cred.RPID)})
 		if err != nil {
 			return err
 		}
@@ -197,10 +245,10 @@ func (s *Store) SaveCredentials(ctx context.Context, credentials []*auth.Passkey
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO passkey_credentials (
-				provider_id, credential_id, rp_id, private_key_pkcs8, user_handle, sign_count, is_active
+				account_id, credential_id, rp_id, private_key_pkcs8, user_handle, sign_count, is_active
 			) VALUES ($1, $2, $3, $4, $5, $6, TRUE)
 		`,
-			providerID,
+			accountID,
 			base64.StdEncoding.EncodeToString(cred.CredentialID),
 			cred.RPID,
 			base64.StdEncoding.EncodeToString(privKeyBytes),
@@ -217,22 +265,25 @@ func (s *Store) SaveCredentials(ctx context.Context, credentials []*auth.Passkey
 	return nil
 }
 
-func ensureProvider(ctx context.Context, tx *sql.Tx, provider string) (int64, error) {
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	if provider == "" {
+func ensureAccount(ctx context.Context, tx *sql.Tx, account Account) (int64, error) {
+	account.Provider = strings.ToLower(strings.TrimSpace(account.Provider))
+	if account.Provider == "" {
 		return 0, fmt.Errorf("provider is required")
 	}
 
 	var id int64
 	err := tx.QueryRowContext(ctx, `
-		INSERT INTO secret_providers (provider)
-		VALUES ($1)
+		INSERT INTO accounts (provider, email, password)
+		VALUES ($1, NULLIF($2, ''), NULLIF($3, ''))
 		ON CONFLICT (provider)
-		DO UPDATE SET provider = EXCLUDED.provider, updated_at = CURRENT_TIMESTAMP
+		DO UPDATE SET
+			email = COALESCE(NULLIF(EXCLUDED.email, ''), accounts.email),
+			password = COALESCE(NULLIF(EXCLUDED.password, ''), accounts.password),
+			updated_at = CURRENT_TIMESTAMP
 		RETURNING id
-	`, provider).Scan(&id)
+	`, account.Provider, account.Email, account.Password).Scan(&id)
 	if err != nil {
-		return 0, fmt.Errorf("ensure provider %s: %w", provider, err)
+		return 0, fmt.Errorf("ensure account %s: %w", account.Provider, err)
 	}
 	return id, nil
 }

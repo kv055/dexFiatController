@@ -114,6 +114,12 @@ func loadConfig() (controller.Config, func()) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
+		if err := seedAccounts(ctx, secretStore, cfg); err != nil {
+			log.Fatalf("failed to seed account credentials: %v", err)
+		}
+		if err := hydrateAccountsFromDB(ctx, secretStore, &cfg); err != nil {
+			log.Fatalf("failed to load account credentials from database: %v", err)
+		}
 		if err := seedTOTPSecrets(ctx, secretStore, cfg); err != nil {
 			log.Fatalf("failed to seed TOTP secrets: %v", err)
 		}
@@ -184,6 +190,52 @@ func seedTOTPSecrets(ctx context.Context, store *secrets.Store, cfg controller.C
 	}
 	if err := store.UpsertTOTPSecret(ctx, "wise", cfg.Wise.TOTPSecret); err != nil {
 		return err
+	}
+	return nil
+}
+
+func seedAccounts(ctx context.Context, store *secrets.Store, cfg controller.Config) error {
+	if err := store.UpsertAccount(ctx, "paypal", cfg.PayPal.Email, cfg.PayPal.Password); err != nil {
+		return err
+	}
+	if err := store.UpsertAccount(ctx, "wise", cfg.Wise.Email, cfg.Wise.Password); err != nil {
+		return err
+	}
+	if err := store.UpsertAccount(ctx, "revolut", cfg.Revolut.Email, cfg.Revolut.Password); err != nil {
+		return err
+	}
+	return nil
+}
+
+func hydrateAccountsFromDB(ctx context.Context, store *secrets.Store, cfg *controller.Config) error {
+	accountsByProvider, err := store.LoadAccounts(ctx)
+	if err != nil {
+		return err
+	}
+
+	if account, ok := accountsByProvider["paypal"]; ok {
+		if cfg.PayPal.Email == "" {
+			cfg.PayPal.Email = account.Email
+		}
+		if cfg.PayPal.Password == "" {
+			cfg.PayPal.Password = account.Password
+		}
+	}
+	if account, ok := accountsByProvider["wise"]; ok {
+		if cfg.Wise.Email == "" {
+			cfg.Wise.Email = account.Email
+		}
+		if cfg.Wise.Password == "" {
+			cfg.Wise.Password = account.Password
+		}
+	}
+	if account, ok := accountsByProvider["revolut"]; ok {
+		if cfg.Revolut.Email == "" {
+			cfg.Revolut.Email = account.Email
+		}
+		if cfg.Revolut.Password == "" {
+			cfg.Revolut.Password = account.Password
+		}
 	}
 	return nil
 }
