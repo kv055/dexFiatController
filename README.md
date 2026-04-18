@@ -97,6 +97,7 @@ The entry point does three things:
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `DATABASE_URL` | `postgres://...` | Shared Postgres database used for TOTP and passkey secret storage |
 | `HEADLESS` | `true` | Run Chrome in headless mode |
 | `CHROME_PATH` | `""` | Override Chrome binary path |
 | `OPENAI_API_KEY` | `""` | For Stagehand AI self-healing |
@@ -104,10 +105,10 @@ The entry point does three things:
 | `TOTP_API_KEY` | `""` | API key for TOTP service authentication |
 | `PAYPAL_EMAIL` | `""` | PayPal login email |
 | `PAYPAL_PASSWORD` | `""` | PayPal login password |
-| `PAYPAL_TOTP_SECRET` | `""` | PayPal TOTP shared secret (base32) |
+| `PAYPAL_TOTP_SECRET` | `""` | Optional bootstrap value that is written into Postgres as the active PayPal TOTP secret |
 | `WISE_EMAIL` | `""` | Wise login email |
 | `WISE_PASSWORD` | `""` | Wise login password |
-| `WISE_TOTP_SECRET` | `""` | Wise TOTP shared secret (base32) |
+| `WISE_TOTP_SECRET` | `""` | Optional bootstrap value that is written into Postgres as the active Wise TOTP secret |
 | `WISE_PHONE` | `""` | Wise phone number (for SMS 2FA) |
 | `REVOLUT_EMAIL` | `""` | Revolut login email |
 | `REVOLUT_PASSWORD` | `""` | Revolut login password |
@@ -260,6 +261,7 @@ The core passkey automation engine. Uses Chrome DevTools Protocol's **WebAuthn d
 - `authenticators` — map of `contextKey → AuthenticatorID`, one per chromedp browser context
 - `privateKeys` — map of `rpID → ECDSA private key` for credential signing
 - `credentials` — map of `rpID → []*PasskeyCredential` for re-provisioning to new contexts
+- `store` — pluggable persistence backend (Postgres in the normal deployment)
 
 **Why per-context?** Each connector operation creates a fresh browser context via `browser.NewContext()`. CDP WebAuthn commands are scoped to the browser context they are sent on. The `PasskeyManager` therefore tracks one virtual authenticator per context, keyed by `chromedp.FromContext(ctx).Target.TargetID`.
 
@@ -277,9 +279,15 @@ The core passkey automation engine. Uses Chrome DevTools Protocol's **WebAuthn d
 
 **`SetUserVerified(ctx, verified)`** — signals to the virtual authenticator whether the user has been verified. Called with `true` before a WebAuthn authentication ceremony.
 
-**`AddCredential(ctx, cred)`** — adds a specific WebAuthn credential to the virtual authenticator for the current context. The credential's private key is marshaled to PKCS8, base64-encoded, and sent via `webauthn.AddCredential()`. Also stored in the `credentials` map for re-provisioning to future contexts.
+**`AddCredential(ctx, cred)`** — adds a specific WebAuthn credential to the virtual authenticator for the current context. The credential's private key is marshaled to PKCS8, base64-encoded, and sent via `webauthn.AddCredential()`. Also stored in the `credentials` map for re-provisioning to future contexts and persisted via the configured store backend.
 
-**`GetCredentials(ctx)`**, **`RemoveCredential(ctx, id)`**, **`ClearCredentials(ctx)`** — manage credentials on the virtual authenticator.
+**`GetCredentials(ctx)`**, **`RemoveCredential(ctx, id)`**, **`ClearCredentials(ctx)`** — manage credentials on the virtual authenticator and keep the persisted credential store in sync.
+
+**`SyncCredentialsFromAuthenticator(ctx)`** — imports any credentials that were created by a live `navigator.credentials.create()` registration flow inside Chrome's virtual authenticator, merging them into the in-memory store and persistent backend.
+
+**`RegisterPasskey(ctx, pm, trigger)`** — helper for initial enrollment. It snapshots the current credential set, runs the UI action that triggers passkey creation, waits for the browser to create the new WebAuthn credential, then syncs that credential into the controller's persistent store.
+
+**Persistence model** — on startup, `NewPasskeyManager(ctx, store)` loads any previously saved credentials from the configured backend into memory. Both TOTP secrets and passkey credentials live in the shared Postgres schema managed by `dexUnifiedApi`.
 
 **`PasskeyCredential`** — a WebAuthn credential:
 - `CredentialID` — random 32-byte identifier
@@ -292,11 +300,18 @@ The core passkey automation engine. Uses Chrome DevTools Protocol's **WebAuthn d
 
 **`HandlePasskeyAuthentication(ctx, pm)`** — convenience function: ensures the PasskeyManager is enabled for the context and sets user verified to `true`. This is called by connectors when they encounter a passkey 2FA challenge.
 
-**Flow during login:**
+**Flow during login/authentication:**
 1. Connector calls `passkey.Enable(browserCtx)` right after creating the browser context, before any navigation. This ensures the virtual authenticator is ready before the page triggers a WebAuthn request.
 2. When the service presents a passkey login option, the connector clicks the passkey button.
 3. The browser issues a WebAuthn `navigator.credentials.get()` challenge.
 4. Because `AutomaticPresenceSimulation: true`, the virtual authenticator immediately responds with a signed assertion. No user interaction is needed.
+
+**Flow during initial passkey enrollment:**
+1. After a successful password/2FA login, the connector checks whether the service shows a `create passkey` prompt.
+2. If a passkey already exists for the current host, the connector clicks `skip` to avoid duplicate registration.
+3. Otherwise, the connector calls `RegisterPasskey(...)` and clicks the `create passkey` button.
+4. The page triggers `navigator.credentials.create()`, Chrome stores the new credential in the virtual authenticator, and `SyncCredentialsFromAuthenticator(...)` imports it into the controller's persistent store.
+5. On future logins, that persisted credential is automatically re-provisioned into new browser contexts and used for passkey authentication.
 
 #### `totp.go` — TOTP API Client
 
@@ -801,8 +816,7 @@ docker compose up -d totp-api fiat-controller
 
 | Area | Current State | Needed |
 |---|---|---|
-| **Passkey credential persistence** | Credentials are in-memory only. Container restart loses them. | JSON file persistence + Docker volume. On startup, load from file; on `AddCredential`, persist to file. |
-| **Passkey registration flow** | Only authentication (login) is handled. No way to initially register a passkey on a service. | Add a `RegisterPasskey` flow that navigates to the service's security settings, triggers `navigator.credentials.create()`, and stores the credential. |
+| **Passkey registration coverage** | Passkey registration works when the service shows a post-login `create passkey` prompt, and the new credential is persisted automatically. | Add service-specific navigation into security settings for providers that do not offer the prompt during login. |
 | **Twilio SMS provider** | Stub — `GetLatestCode` and `WaitForCode` return "not yet implemented". | Implement Twilio API calls to fetch recent messages and extract verification codes. |
 | **IMAP email provider** | Stub — same as SMS. | Implement IMAP mailbox polling to find and extract verification codes from emails. |
 | **Transaction parsing** | Uses simple regex patterns to detect transaction items in HTML. | Parse structured data from the DOM (amount, date, counterparty) instead of just detecting presence. |

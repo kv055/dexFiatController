@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	neturl "net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -111,6 +112,9 @@ func (c *Connector) Login(ctx context.Context) error {
 	}
 
 	c.loggedIn = true
+	if err := c.maybeRegisterPasskey(browserCtx); err != nil {
+		log.Printf("[revolut] warning: passkey registration skipped: %v", err)
+	}
 	log.Printf("[revolut] logged in as %s", loginID)
 	return nil
 }
@@ -207,6 +211,59 @@ func (c *Connector) checkLoginSuccess(ctx context.Context) (bool, error) {
 	return !strings.Contains(currentURL, "login") &&
 		!strings.Contains(currentURL, "verify") &&
 		!strings.Contains(currentURL, "authenticate"), nil
+}
+
+func (c *Connector) maybeRegisterPasskey(ctx context.Context) error {
+	if c.passkey == nil {
+		return nil
+	}
+
+	exists, err := c.sh.Exists(ctx, "passkey_create_btn")
+	if err != nil {
+		return fmt.Errorf("revolut: detect passkey enrollment prompt: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+
+	host, err := currentHost(ctx)
+	if err != nil {
+		return fmt.Errorf("revolut: determine current host: %w", err)
+	}
+
+	if c.passkey.HasCredentialsForHost(host) {
+		_, err := c.sh.MaybeClick(ctx, "passkey_skip_btn")
+		if err != nil {
+			return fmt.Errorf("revolut: skip duplicate passkey prompt: %w", err)
+		}
+		log.Printf("[revolut] passkey already exists for host %s; skipping enrollment prompt", host)
+		return nil
+	}
+
+	registered, err := auth.RegisterPasskey(ctx, c.passkey, func() error {
+		return c.sh.Click(ctx, "passkey_create_btn")
+	})
+	if err != nil {
+		_, _ = c.sh.MaybeClick(ctx, "passkey_skip_btn")
+		return fmt.Errorf("revolut: register passkey: %w", err)
+	}
+	if registered {
+		log.Printf("[revolut] passkey registered for host %s", host)
+	}
+	return nil
+}
+
+func currentHost(ctx context.Context) (string, error) {
+	var currentURL string
+	if err := chromedp.Location(&currentURL).Do(ctx); err != nil {
+		return "", err
+	}
+
+	parsed, err := neturl.Parse(currentURL)
+	if err != nil {
+		return "", err
+	}
+	return parsed.Hostname(), nil
 }
 
 func (c *Connector) IsLoggedIn(ctx context.Context) (bool, error) {
@@ -346,8 +403,8 @@ func (c *Connector) SendPayment(ctx context.Context, req models.SendPaymentReque
 
 	return &models.SendPaymentResult{
 		TransactionID: fmt.Sprintf("revolut-send-%d", time.Now().UnixMilli()),
-		Status:       models.TxStatusCompleted,
-		Timestamp:    time.Now(),
+		Status:        models.TxStatusCompleted,
+		Timestamp:     time.Now(),
 	}, nil
 }
 

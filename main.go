@@ -12,10 +12,12 @@ import (
 	"dexFiatController/internal/browser"
 	"dexFiatController/internal/controller"
 	"dexFiatController/internal/models"
+	"dexFiatController/internal/secrets"
 )
 
 func main() {
-	cfg := loadConfig()
+	cfg, cleanup := loadConfig()
+	defer cleanup()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -52,11 +54,13 @@ func main() {
 	log.Println("shutting down...")
 }
 
-func loadConfig() controller.Config {
+func loadConfig() (controller.Config, func()) {
 	pollInterval, err := time.ParseDuration(envOr("POLL_INTERVAL", "30s"))
 	if err != nil {
 		pollInterval = 30 * time.Second
 	}
+
+	cleanup := func() {}
 
 	browserCfg := browser.DefaultConfig()
 	browserCfg.Headless = envOr("HEADLESS", "true") == "true"
@@ -69,19 +73,11 @@ func loadConfig() controller.Config {
 	totpKey := envOr("TOTP_API_KEY", "")
 	totpClient := auth.NewTOTPClient(totpURL, totpKey)
 
-	passkeyManager := auth.NewPasskeyManager()
-
-	smsProvider := initSMSProvider()
-	emailProvider := initEmailProvider()
-
-	return controller.Config{
+	cfg := controller.Config{
 		Browser:      browserCfg,
 		Stagehand:    stagehandCfg,
 		PollInterval: pollInterval,
 		TOTP:         totpClient,
-		Passkey:      passkeyManager,
-		SMS:          smsProvider,
-		Email:        emailProvider,
 		PayPal: models.ConnectorConfig{
 			Email:      envOr("PAYPAL_EMAIL", ""),
 			Password:   envOr("PAYPAL_PASSWORD", ""),
@@ -102,6 +98,46 @@ func loadConfig() controller.Config {
 			Headless: browserCfg.Headless,
 		},
 	}
+
+	var passkeyStore auth.PasskeyStore
+	if databaseURL := envOr("DATABASE_URL", ""); databaseURL != "" {
+		secretStore, err := secrets.Open(databaseURL)
+		if err != nil {
+			log.Fatalf("failed to open secrets database: %v", err)
+		}
+		cleanup = func() {
+			if err := secretStore.Close(); err != nil {
+				log.Printf("warning: close secrets database: %v", err)
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := seedTOTPSecrets(ctx, secretStore, cfg); err != nil {
+			log.Fatalf("failed to seed TOTP secrets: %v", err)
+		}
+		if err := hydrateTOTPSecretsFromDB(ctx, secretStore, &cfg); err != nil {
+			log.Fatalf("failed to load TOTP secrets from database: %v", err)
+		}
+
+		passkeyStore = secretStore
+	} else {
+		log.Fatal("DATABASE_URL is required for unified TOTP/passkey storage")
+	}
+
+	passkeyManager, err := auth.NewPasskeyManager(context.Background(), passkeyStore)
+	if err != nil {
+		log.Fatalf("failed to initialize passkey manager: %v", err)
+	}
+	cfg.Passkey = passkeyManager
+
+	smsProvider := initSMSProvider()
+	emailProvider := initEmailProvider()
+	cfg.SMS = smsProvider
+	cfg.Email = emailProvider
+
+	return cfg, cleanup
 }
 
 func initSMSProvider() auth.SMSProvider {
@@ -140,4 +176,29 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func seedTOTPSecrets(ctx context.Context, store *secrets.Store, cfg controller.Config) error {
+	if err := store.UpsertTOTPSecret(ctx, "paypal", cfg.PayPal.TOTPSecret); err != nil {
+		return err
+	}
+	if err := store.UpsertTOTPSecret(ctx, "wise", cfg.Wise.TOTPSecret); err != nil {
+		return err
+	}
+	return nil
+}
+
+func hydrateTOTPSecretsFromDB(ctx context.Context, store *secrets.Store, cfg *controller.Config) error {
+	secretsByProvider, err := store.LoadActiveTOTPSecrets(ctx)
+	if err != nil {
+		return err
+	}
+
+	if cfg.PayPal.TOTPSecret == "" {
+		cfg.PayPal.TOTPSecret = secretsByProvider["paypal"]
+	}
+	if cfg.Wise.TOTPSecret == "" {
+		cfg.Wise.TOTPSecret = secretsByProvider["wise"]
+	}
+	return nil
 }

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
 	"github.com/sashabaranov/go-openai"
 )
@@ -22,9 +23,9 @@ type SelectorEntry struct {
 }
 
 type SelectorRegistry struct {
-	mu       sync.RWMutex
-	entries  map[string]*SelectorEntry
-	service  string
+	mu      sync.RWMutex
+	entries map[string]*SelectorEntry
+	service string
 }
 
 func NewSelectorRegistry(service string) *SelectorRegistry {
@@ -82,9 +83,9 @@ func DefaultStagehandConfig() StagehandConfig {
 }
 
 type Stagehand struct {
-	cfg     StagehandConfig
-	client  *openai.Client
-	service string
+	cfg      StagehandConfig
+	client   *openai.Client
+	service  string
 	registry *SelectorRegistry
 }
 
@@ -139,6 +140,58 @@ func (s *Stagehand) WaitReady(ctx context.Context, selectorKey string) error {
 
 func (s *Stagehand) Navigate(ctx context.Context, url string) error {
 	return chromedp.Navigate(url).Do(ctx)
+}
+
+func (s *Stagehand) Exists(ctx context.Context, selectorKey string) (bool, error) {
+	entry, ok := s.registry.Get(selectorKey)
+	if !ok {
+		return false, fmt.Errorf("stagehand: selector %q not registered for %s", selectorKey, s.service)
+	}
+
+	selectors := []string{entry.CSS}
+	selectors = append(selectors, entry.FallbackChain...)
+
+	for _, sel := range selectors {
+		var nodes []*cdp.Node
+		if err := chromedp.Nodes(sel, &nodes, chromedp.ByQueryAll).Do(ctx); err != nil {
+			continue
+		}
+		if len(nodes) > 0 {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func (s *Stagehand) MaybeClick(ctx context.Context, selectorKey string) (bool, error) {
+	entry, ok := s.registry.Get(selectorKey)
+	if !ok {
+		return false, fmt.Errorf("stagehand: selector %q not registered for %s", selectorKey, s.service)
+	}
+
+	selectors := []string{entry.CSS}
+	selectors = append(selectors, entry.FallbackChain...)
+
+	for i, sel := range selectors {
+		var nodes []*cdp.Node
+		if err := chromedp.Nodes(sel, &nodes, chromedp.ByQueryAll).Do(ctx); err != nil {
+			continue
+		}
+		if len(nodes) == 0 {
+			continue
+		}
+
+		if err := chromedp.Click(sel, chromedp.ByQuery).Do(ctx); err != nil {
+			return false, err
+		}
+		if i > 0 {
+			s.registry.UpdateHealed(selectorKey, sel, "fallback")
+		}
+		return true, nil
+	}
+
+	return false, nil
 }
 
 func (s *Stagehand) Execute(ctx context.Context, actions ...chromedp.Action) error {
