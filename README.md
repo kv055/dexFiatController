@@ -122,6 +122,9 @@ The entry point does three things:
 | `EMAIL_IMAP_USER` | `""` | IMAP username |
 | `EMAIL_IMAP_PASS` | `""` | IMAP password |
 | `POLL_INTERVAL` | `30s` | Transaction polling interval |
+| `PAYMENT_NOTIFICATIONS_API_URL` | `""` | Endpoint on `dexUnifiedApi` that accepts connector payment events |
+| `PAYMENT_NOTIFICATIONS_SHARED_SECRET` | `""` | Optional webhook secret sent as `X-Webhook-Secret` |
+| `PAYMENT_NOTIFICATIONS_DEX` | `""` | Default DEX label attached when a connector does not provide one in metadata |
 
 ---
 
@@ -149,6 +152,18 @@ Defines the shared data types used across all connectors and the controller:
 
 **`ConnectorConfig`** — Per-connector credentials:
 - `Email`, `Password`, `TOTPSecret`, `Phone`, `Headless`
+
+---
+
+### Payment Notifications
+
+`dexFiatController` now includes a shared notifier in `internal/notifications` that every connector-facing flow can reuse.
+
+- Payloads are sent as JSON to `dexUnifiedApi`
+- Standard fields: `amount`, `currency`, `type`, `transaction_id`, `dex`, `connector`, `transfer_message`
+- `metadata` carries connector-specific unstructured fields such as reference, counterparty, status, and raw parsed fields
+- Observed transactions from the polling loop are forwarded automatically
+- Direct `SendPayment(...)` calls also forward an outgoing payment notification immediately
 
 ---
 

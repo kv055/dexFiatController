@@ -12,6 +12,7 @@ import (
 	"dexFiatController/internal/browser"
 	"dexFiatController/internal/controller"
 	"dexFiatController/internal/models"
+	"dexFiatController/internal/notifications"
 	"dexFiatController/internal/secrets"
 )
 
@@ -77,7 +78,13 @@ func loadConfig() (controller.Config, func()) {
 		Browser:      browserCfg,
 		Stagehand:    stagehandCfg,
 		PollInterval: pollInterval,
-		TOTP:         totpClient,
+		Notifier: notifications.NewClient(notifications.Config{
+			Endpoint:   envOr("PAYMENT_NOTIFICATIONS_API_URL", ""),
+			Secret:     envOr("PAYMENT_NOTIFICATIONS_SHARED_SECRET", ""),
+			DefaultDEX: envOr("PAYMENT_NOTIFICATIONS_DEX", ""),
+			Timeout:    10 * time.Second,
+		}),
+		TOTP: totpClient,
 		PayPal: models.ConnectorConfig{
 			Email:      envOr("PAYPAL_EMAIL", ""),
 			Password:   envOr("PAYPAL_PASSWORD", ""),

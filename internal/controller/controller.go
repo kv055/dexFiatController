@@ -11,6 +11,7 @@ import (
 	"dexFiatController/internal/browser"
 	"dexFiatController/internal/connector"
 	"dexFiatController/internal/models"
+	"dexFiatController/internal/notifications"
 
 	paypal "dexFiatController/internal/connector/paypal"
 	revolut "dexFiatController/internal/connector/revolut"
@@ -18,16 +19,17 @@ import (
 )
 
 type Config struct {
-	PayPal      models.ConnectorConfig
-	Wise        models.ConnectorConfig
-	Revolut     models.ConnectorConfig
-	Browser     browser.Config
-	Stagehand   browser.StagehandConfig
+	PayPal       models.ConnectorConfig
+	Wise         models.ConnectorConfig
+	Revolut      models.ConnectorConfig
+	Browser      browser.Config
+	Stagehand    browser.StagehandConfig
 	PollInterval time.Duration
-	TOTP        *auth.TOTPClient
-	Passkey     *auth.PasskeyManager
-	SMS         auth.SMSProvider
-	Email       auth.EmailProvider
+	Notifier     *notifications.Client
+	TOTP         *auth.TOTPClient
+	Passkey      *auth.PasskeyManager
+	SMS          auth.SMSProvider
+	Email        auth.EmailProvider
 }
 
 type FiatController struct {
@@ -45,8 +47,8 @@ func New(cfg Config) (*FiatController, error) {
 
 	fc := &FiatController{
 		connectors: make(map[string]connector.Connector),
-		browser:   inst,
-		cfg:       cfg,
+		browser:    inst,
+		cfg:        cfg,
 	}
 
 	if err := fc.initConnectors(); err != nil {
@@ -127,7 +129,14 @@ func (fc *FiatController) SendPayment(ctx context.Context, service string, req m
 	if !ok {
 		return nil, fmt.Errorf("controller: unknown service %q", service)
 	}
-	return c.SendPayment(ctx, req)
+	result, err := c.SendPayment(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if err := fc.cfg.Notifier.PublishSendPaymentResult(ctx, service, req, result, nil); err != nil {
+		log.Printf("[controller] %s: publish send-payment notification failed: %v", service, err)
+	}
+	return result, nil
 }
 
 func (fc *FiatController) GetBalance(ctx context.Context, service, currency string) (*models.Balance, error) {
@@ -173,6 +182,9 @@ func (fc *FiatController) MonitorTransactions(ctx context.Context, handler func(
 				for _, tx := range txns {
 					if !seen[name][tx.ID] {
 						seen[name][tx.ID] = true
+						if err := fc.cfg.Notifier.PublishTransaction(ctx, name, tx); err != nil {
+							log.Printf("[controller] %s: publish transaction notification failed: %v", name, err)
+						}
 						handler(name, tx)
 					}
 				}
