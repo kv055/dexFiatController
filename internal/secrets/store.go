@@ -22,6 +22,7 @@ type Account struct {
 	Provider string
 	Email    string
 	Password string
+	Phone    string
 }
 
 func Open(databaseURL string) (*Store, error) {
@@ -69,7 +70,7 @@ func (s *Store) LoadActiveTOTPSecrets(ctx context.Context) (map[string]string, e
 
 func (s *Store) LoadAccounts(ctx context.Context) (map[string]Account, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT provider, COALESCE(email, ''), COALESCE(password, '')
+		SELECT provider, COALESCE(email, ''), COALESCE(password, ''), COALESCE(phone, '')
 		FROM accounts
 	`)
 	if err != nil {
@@ -80,7 +81,7 @@ func (s *Store) LoadAccounts(ctx context.Context) (map[string]Account, error) {
 	accounts := make(map[string]Account)
 	for rows.Next() {
 		var account Account
-		if err := rows.Scan(&account.Provider, &account.Email, &account.Password); err != nil {
+		if err := rows.Scan(&account.Provider, &account.Email, &account.Password, &account.Phone); err != nil {
 			return nil, fmt.Errorf("scan account: %w", err)
 		}
 		accounts[account.Provider] = account

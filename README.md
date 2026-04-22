@@ -89,7 +89,7 @@ The entry point does three things:
 
 1. **Configuration loading** — reads all environment variables and constructs a `controller.Config`. This includes creating the `PasskeyManager`, `TOTPClient`, `SMSProvider`, and `EmailProvider` instances based on which env vars are set.
 
-2. **Controller initialization** — calls `controller.New(cfg)` which creates the shared browser instance and initializes all connectors whose email is configured (non-empty `PAYPAL_EMAIL`, `WISE_EMAIL`, `REVOLUT_EMAIL`).
+2. **Controller initialization** — loads PayPal, Wise, and Revolut account settings from Postgres, then calls `controller.New(cfg)` which creates the shared browser instance and initializes all connectors whose database account has an email configured.
 
 3. **Runtime loop** — logs in to all connectors, starts the transaction monitor in a goroutine, and blocks on OS signals (`SIGINT`, `SIGTERM`) for graceful shutdown.
 
@@ -103,16 +103,6 @@ The entry point does three things:
 | `OPENAI_API_KEY` | `""` | For Stagehand AI self-healing |
 | `TOTP_API_URL` | `http://totp-api:8080` | TOTP API service URL |
 | `TOTP_API_KEY` | `""` | API key for TOTP service authentication |
-| `PAYPAL_EMAIL` | `""` | PayPal login email |
-| `PAYPAL_PASSWORD` | `""` | PayPal login password |
-| `PAYPAL_TOTP_SECRET` | `""` | Optional bootstrap value that is written into Postgres as the active PayPal TOTP secret |
-| `WISE_EMAIL` | `""` | Wise login email |
-| `WISE_PASSWORD` | `""` | Wise login password |
-| `WISE_TOTP_SECRET` | `""` | Optional bootstrap value that is written into Postgres as the active Wise TOTP secret |
-| `WISE_PHONE` | `""` | Wise phone number (for SMS 2FA) |
-| `REVOLUT_EMAIL` | `""` | Revolut login email |
-| `REVOLUT_PASSWORD` | `""` | Revolut login password |
-| `REVOLUT_PHONE` | `""` | Revolut phone number (for SMS 2FA) |
 | `SMS_PROVIDER` | `""` | `twilio` to enable Twilio SMS |
 | `SMS_ACCOUNT_SID` | `""` | Twilio Account SID |
 | `SMS_AUTH_TOKEN` | `""` | Twilio Auth Token |
@@ -125,6 +115,8 @@ The entry point does three things:
 | `PAYMENT_NOTIFICATIONS_API_URL` | `""` | Endpoint on `dexUnifiedApi` that accepts connector payment events |
 | `PAYMENT_NOTIFICATIONS_SHARED_SECRET` | `""` | Optional webhook secret sent as `X-Webhook-Secret` |
 | `PAYMENT_NOTIFICATIONS_DEX` | `""` | Default DEX label attached when a connector does not provide one in metadata |
+
+PayPal, Wise, and Revolut credentials, phone numbers, TOTP secrets, and passkeys are read from the shared database only. They are not accepted from `.env` or Docker environment variables.
 
 ---
 
@@ -628,8 +620,6 @@ Validates the secret by attempting to generate a code with it before storing.
 
 **Authentication:** If `API_KEY` env var is set, all endpoints (except `/health`) require an `X-API-Key` header or `api_key` query parameter. The key is compared using constant-time comparison to prevent timing attacks.
 
-**Pre-loaded secrets:** The `TOTP_SECRETS` env var accepts a comma-separated list of `service=secret` pairs (e.g. `"paypal=ABC123,wise=DEF456"`) that are loaded at startup.
-
 **Docker:** The TOTP API has its own Dockerfile and Go module, separate from the main controller. It is built as a minimal Alpine image with just `ca-certificates`.
 
 ---
@@ -774,7 +764,6 @@ totp-api:
   environment:
     - PORT=8080
     - API_KEY=${TOTP_API_KEY:-}
-    - TOTP_SECRETS=${TOTP_SECRETS:-}
   healthcheck:
     test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
   resources:
@@ -796,16 +785,6 @@ fiat-controller:
     - OPENAI_API_KEY=${OPENAI_API_KEY:-}
     - TOTP_API_URL=http://totp-api:8080
     - TOTP_API_KEY=${TOTP_API_KEY:-}
-    - PAYPAL_EMAIL=${PAYPAL_EMAIL:-}
-    - PAYPAL_PASSWORD=${PAYPAL_PASSWORD:-}
-    - PAYPAL_TOTP_SECRET=${PAYPAL_TOTP_SECRET:-}
-    - WISE_EMAIL=${WISE_EMAIL:-}
-    - WISE_PASSWORD=${WISE_PASSWORD:-}
-    - WISE_TOTP_SECRET=${WISE_TOTP_SECRET:-}
-    - WISE_PHONE=${WISE_PHONE:-}
-    - REVOLUT_EMAIL=${REVOLUT_EMAIL:-}
-    - REVOLUT_PASSWORD=${REVOLUT_PASSWORD:-}
-    - REVOLUT_PHONE=${REVOLUT_PHONE:-}
     - SMS_PROVIDER=${SMS_PROVIDER:-}
     - EMAIL_PROVIDER=${EMAIL_PROVIDER:-}
     # ... plus SMS and IMAP env vars
