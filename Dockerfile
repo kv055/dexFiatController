@@ -1,4 +1,6 @@
 FROM golang:1.25-alpine AS builder
+ARG GOPROXY=https://goproxy.io,https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
 
 RUN apk add --no-cache git chromium
 
