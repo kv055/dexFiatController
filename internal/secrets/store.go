@@ -267,7 +267,7 @@ func (s *Store) SaveCredentials(ctx context.Context, credentials []*auth.Passkey
 }
 
 func ensureAccount(ctx context.Context, tx *sql.Tx, account Account) (int64, error) {
-	account.Provider = strings.ToLower(strings.TrimSpace(account.Provider))
+	account.Provider = normalizeProvider(account.Provider)
 	if account.Provider == "" {
 		return 0, fmt.Errorf("provider is required")
 	}
@@ -293,12 +293,50 @@ func providerForRPID(rpID string) string {
 	rpID = strings.ToLower(strings.TrimSpace(rpID))
 	switch {
 	case strings.Contains(rpID, "paypal"):
-		return "paypal"
+		return "PayPal"
 	case strings.Contains(rpID, "wise"):
-		return "wise"
+		return "WISE"
 	case strings.Contains(rpID, "revolut"):
-		return "revolut"
+		return "Revolut"
 	default:
-		return rpID
+		return normalizeProvider(rpID)
+	}
+}
+
+func normalizeProvider(value string) string {
+	trimmed := strings.TrimSpace(value)
+	switch strings.ToLower(trimmed) {
+	case "wise":
+		return "WISE"
+	case "paypal":
+		return "PayPal"
+	case "revolut":
+		return "Revolut"
+	case "n26":
+		return "N26"
+	case "robosats":
+		return "Robosats"
+	case "bisq":
+		return "Bisq"
+	case "hodlhodl":
+		return "HodlHodl"
+	case "kraken":
+		return "Kraken"
+	case "coinbase":
+		return "Coinbase"
+	case "bitstamp":
+		return "Bitstamp"
+	case "binance":
+		return "Binance"
+	case "bybit":
+		return "ByBit"
+	case "kucoin":
+		return "KuCoin"
+	case "huobi":
+		return "Huobi"
+	case "lnd", "lnd wallet", "lnd_wallet":
+		return "LND wallet"
+	default:
+		return trimmed
 	}
 }
