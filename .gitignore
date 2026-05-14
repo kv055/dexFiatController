@@ -27,6 +27,7 @@ go.work.sum
 # env file
 .env
 .env.keys
+.env.hash
 
 # Built binaries
 totp-api
