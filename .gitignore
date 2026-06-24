@@ -36,3 +36,5 @@ dexFiatController
 # Editor/IDE
 # .idea/
 # .vscode/
+# Claude Code
+.claude/
