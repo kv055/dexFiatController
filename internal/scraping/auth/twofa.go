@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"dexFiatController/internal/connector"
+	"dexFiatController/internal/scraping/connector"
 )
 
 type Resolver struct {

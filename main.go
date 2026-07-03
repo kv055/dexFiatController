@@ -8,54 +8,87 @@ import (
 	"syscall"
 	"time"
 
-	"dexFiatController/internal/auth"
-	"dexFiatController/internal/browser"
-	"dexFiatController/internal/controller"
-	"dexFiatController/internal/models"
-	"dexFiatController/internal/notifications"
-	"dexFiatController/internal/secrets"
+	"dexFiatController/internal/pushpush"
+
+	scrapingauth "dexFiatController/internal/scraping/auth"
+	scrapingbrowser "dexFiatController/internal/scraping/browser"
+	scrapingcontroller "dexFiatController/internal/scraping/controller"
+	scrapingmodels "dexFiatController/internal/scraping/models"
+	scrapingnotifications "dexFiatController/internal/scraping/notifications"
+	scrapingsecrets "dexFiatController/internal/scraping/secrets"
 )
 
 func main() {
-	cfg, cleanup := loadConfig()
-	defer cleanup()
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	fc, err := controller.New(cfg)
+	// pushpush is the primary fiat-arrival path: it receives pushed payment
+	// notifications, matches them to pending transactions, and triggers BTC release.
+	ppCfg := pushpush.LoadConfig()
+	if ppCfg.Addr == "" {
+		ppCfg.Addr = ":8080"
+	}
+	ppServer, err := pushpush.New(ppCfg)
+	if err != nil {
+		log.Fatalf("failed to create pushpush server: %v", err)
+	}
+	defer ppServer.Close()
+
+	go func() {
+		if err := ppServer.Run(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("pushpush server: %v", err)
+		}
+	}()
+	log.Printf("pushpush listening on %s (escalation=%v)", ppCfg.Addr, ppCfg.EscalationEnabled())
+
+	// Scraping is the last-resort path: only run when explicitly enabled.
+	if envOr("SCRAPING_ENABLED", "false") == "true" {
+		runScraping(ctx)
+	} else {
+		log.Println("scraping controller disabled (set SCRAPING_ENABLED=true to enable as last resort)")
+	}
+
+	<-ctx.Done()
+	log.Println("shutting down...")
+}
+
+// runScraping starts the browser-automation fiat controller. It is gated behind
+// SCRAPING_ENABLED because provider websites change often and push-based arrival is
+// preferred wherever a connector can push notifications.
+func runScraping(ctx context.Context) {
+	cfg, cleanup := loadScrapingConfig()
+	defer cleanup()
+
+	fc, err := scrapingcontroller.New(cfg)
 	if err != nil {
 		log.Fatalf("failed to create fiat controller: %v", err)
 	}
 	defer fc.Close()
 
-	log.Printf("initialized connectors: %v", fc.ListConnectors())
+	log.Printf("initialized scraping connectors: %v", fc.ListConnectors())
 
 	for _, name := range fc.ListConnectors() {
 		pref := fc.Get2FAPreferences(name)
 		log.Printf("[2fa] %s: primary=%s secondary=%s fallback=%s", name, pref.Primary, pref.Secondary, pref.Fallback)
 	}
 
-	log.Println("logging into all connectors...")
+	log.Println("logging into all scraping connectors...")
 	if err := fc.LoginAll(ctx); err != nil {
 		log.Printf("warning: some logins failed: %v", err)
 	}
 
-	log.Println("starting transaction monitor...")
+	log.Println("starting scraping transaction monitor...")
 	go func() {
-		if err := fc.MonitorTransactions(ctx, func(service string, tx models.Transaction) {
+		if err := fc.MonitorTransactions(ctx, func(service string, tx scrapingmodels.Transaction) {
 			log.Printf("[monitor] %s: %s %s %.2f %s -> %s",
 				service, tx.Direction, tx.Status, tx.Amount, tx.Currency, tx.Counterparty)
 		}); err != nil && ctx.Err() == nil {
-			log.Printf("monitor failed: %v", err)
+			log.Printf("scraping monitor failed: %v", err)
 		}
 	}()
-
-	<-ctx.Done()
-	log.Println("shutting down...")
 }
 
-func loadConfig() (controller.Config, func()) {
+func loadScrapingConfig() (scrapingcontroller.Config, func()) {
 	pollInterval, err := time.ParseDuration(envOr("POLL_INTERVAL", "30s"))
 	if err != nil {
 		pollInterval = 30 * time.Second
@@ -65,42 +98,42 @@ func loadConfig() (controller.Config, func()) {
 		// no secrets DB opened; nothing to close
 	}
 
-	browserCfg := browser.DefaultConfig()
+	browserCfg := scrapingbrowser.DefaultConfig()
 	browserCfg.Headless = envOr("HEADLESS", "true") == "true"
 	browserCfg.ChromePath = envOr("CHROME_PATH", "")
 
-	stagehandCfg := browser.DefaultStagehandConfig()
+	stagehandCfg := scrapingbrowser.DefaultStagehandConfig()
 	stagehandCfg.OpenAIKey = envOr("OPENAI_API_KEY", "")
 
 	totpURL := envOr("TOTP_API_URL", "http://totp-api:8080")
 	totpKey := envOr("TOTP_API_KEY", "")
-	totpClient := auth.NewTOTPClient(totpURL, totpKey)
+	totpClient := scrapingauth.NewTOTPClient(totpURL, totpKey)
 
-	cfg := controller.Config{
+	cfg := scrapingcontroller.Config{
 		Browser:      browserCfg,
 		Stagehand:    stagehandCfg,
 		PollInterval: pollInterval,
-		Notifier: notifications.NewClient(notifications.Config{
+		Notifier: scrapingnotifications.NewClient(scrapingnotifications.Config{
 			Endpoint:   envOr("PAYMENT_NOTIFICATIONS_API_URL", ""),
 			Secret:     envOr("PAYMENT_NOTIFICATIONS_SHARED_SECRET", ""),
 			DefaultDEX: envOr("PAYMENT_NOTIFICATIONS_DEX", ""),
 			Timeout:    10 * time.Second,
 		}),
 		TOTP: totpClient,
-		PayPal: models.ConnectorConfig{
+		PayPal: scrapingmodels.ConnectorConfig{
 			Headless: browserCfg.Headless,
 		},
-		Wise: models.ConnectorConfig{
+		Wise: scrapingmodels.ConnectorConfig{
 			Headless: browserCfg.Headless,
 		},
-		Revolut: models.ConnectorConfig{
+		Revolut: scrapingmodels.ConnectorConfig{
 			Headless: browserCfg.Headless,
 		},
 	}
 
-	var passkeyStore auth.PasskeyStore
+	var passkeyStore scrapingauth.PasskeyStore
 	if databaseURL := envOr("DATABASE_URL", ""); databaseURL != "" {
-		secretStore, err := secrets.Open(databaseURL)
+		secretStore, err := scrapingsecrets.Open(databaseURL)
 		if err != nil {
 			log.Fatalf("failed to open secrets database: %v", err)
 		}
@@ -125,25 +158,23 @@ func loadConfig() (controller.Config, func()) {
 		log.Fatal("DATABASE_URL is required for unified TOTP/passkey storage")
 	}
 
-	passkeyManager, err := auth.NewPasskeyManager(context.Background(), passkeyStore)
+	passkeyManager, err := scrapingauth.NewPasskeyManager(context.Background(), passkeyStore)
 	if err != nil {
 		log.Fatalf("failed to initialize passkey manager: %v", err)
 	}
 	cfg.Passkey = passkeyManager
 
-	smsProvider := initSMSProvider()
-	emailProvider := initEmailProvider()
-	cfg.SMS = smsProvider
-	cfg.Email = emailProvider
+	cfg.SMS = initSMSProvider()
+	cfg.Email = initEmailProvider()
 
 	return cfg, cleanup
 }
 
-func initSMSProvider() auth.SMSProvider {
+func initSMSProvider() scrapingauth.SMSProvider {
 	provider := envOr("SMS_PROVIDER", "")
 	switch provider {
 	case "twilio":
-		return auth.NewTwilioSMSProvider(
+		return scrapingauth.NewTwilioSMSProvider(
 			envOr("SMS_ACCOUNT_SID", ""),
 			envOr("SMS_AUTH_TOKEN", ""),
 			envOr("SMS_PHONE_NUMBER", ""),
@@ -154,11 +185,11 @@ func initSMSProvider() auth.SMSProvider {
 	}
 }
 
-func initEmailProvider() auth.EmailProvider {
+func initEmailProvider() scrapingauth.EmailProvider {
 	provider := envOr("EMAIL_PROVIDER", "")
 	switch provider {
 	case "imap":
-		return auth.NewIMAPProvider(
+		return scrapingauth.NewIMAPProvider(
 			envOr("EMAIL_IMAP_HOST", ""),
 			993,
 			envOr("EMAIL_IMAP_USER", ""),
@@ -177,7 +208,7 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func hydrateAccountsFromDB(ctx context.Context, store *secrets.Store, cfg *controller.Config) error {
+func hydrateAccountsFromDB(ctx context.Context, store *scrapingsecrets.Store, cfg *scrapingcontroller.Config) error {
 	accountsByProvider, err := store.LoadAccounts(ctx)
 	if err != nil {
 		return err
@@ -216,7 +247,7 @@ func hydrateAccountsFromDB(ctx context.Context, store *secrets.Store, cfg *contr
 	return nil
 }
 
-func hydrateTOTPSecretsFromDB(ctx context.Context, store *secrets.Store, cfg *controller.Config) error {
+func hydrateTOTPSecretsFromDB(ctx context.Context, store *scrapingsecrets.Store, cfg *scrapingcontroller.Config) error {
 	secretsByProvider, err := store.LoadActiveTOTPSecrets(ctx)
 	if err != nil {
 		return err

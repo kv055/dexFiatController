@@ -7,15 +7,15 @@ import (
 	"sync"
 	"time"
 
-	"dexFiatController/internal/auth"
-	"dexFiatController/internal/browser"
-	"dexFiatController/internal/connector"
-	"dexFiatController/internal/models"
-	"dexFiatController/internal/notifications"
+	"dexFiatController/internal/scraping/auth"
+	"dexFiatController/internal/scraping/browser"
+	"dexFiatController/internal/scraping/connector"
+	"dexFiatController/internal/scraping/models"
+	"dexFiatController/internal/scraping/notifications"
 
-	paypal "dexFiatController/internal/connector/paypal"
-	revolut "dexFiatController/internal/connector/revolut"
-	wise "dexFiatController/internal/connector/wise"
+	paypal "dexFiatController/internal/scraping/connector/paypal"
+	revolut "dexFiatController/internal/scraping/connector/revolut"
+	wise "dexFiatController/internal/scraping/connector/wise"
 )
 
 type Config struct {

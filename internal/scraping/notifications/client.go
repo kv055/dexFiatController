@@ -3,7 +3,7 @@ package notifications
 import (
 	"bytes"
 	"context"
-	"dexFiatController/internal/models"
+	"dexFiatController/internal/scraping/models"
 	"encoding/json"
 	"fmt"
 	"net/http"

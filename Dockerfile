@@ -17,6 +17,13 @@ RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefo
 
 ENV CHROME_PATH=/usr/bin/chromium-browser
 ENV HEADLESS=true
+ENV PUSHPUSH_ADDR=:8080
+
+# pushpush data dir (rules.json + notifications.jsonl persisted here).
+RUN mkdir -p /data
+VOLUME ["/data"]
+
+EXPOSE 8080
 
 COPY --from=builder /dexFiatController /usr/local/bin/dexFiatController
 

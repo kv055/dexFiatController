@@ -3,7 +3,7 @@ package connector
 import (
 	"context"
 
-	"dexFiatController/internal/models"
+	"dexFiatController/internal/scraping/models"
 )
 
 type Connector interface {

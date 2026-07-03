@@ -11,7 +11,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"dexFiatController/internal/auth"
+	"dexFiatController/internal/scraping/auth"
 )
 
 type Store struct {

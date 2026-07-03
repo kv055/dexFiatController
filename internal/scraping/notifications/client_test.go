@@ -1,7 +1,7 @@
 package notifications
 
 import (
-	"dexFiatController/internal/models"
+	"dexFiatController/internal/scraping/models"
 	"testing"
 	"time"
 )

@@ -1,7 +1,7 @@
 package revolut
 
 import (
-	"dexFiatController/internal/browser"
+	"dexFiatController/internal/scraping/browser"
 )
 
 func RegisterSelectors(r *browser.SelectorRegistry) {

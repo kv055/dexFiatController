@@ -1,4 +1,4 @@
-package paypal
+package revolut
 
 import (
 	"context"
@@ -12,51 +12,45 @@ import (
 
 	"github.com/chromedp/chromedp"
 
-	"dexFiatController/internal/auth"
-	"dexFiatController/internal/browser"
-	"dexFiatController/internal/connector"
-	"dexFiatController/internal/models"
+	"dexFiatController/internal/scraping/auth"
+	"dexFiatController/internal/scraping/browser"
+	"dexFiatController/internal/scraping/connector"
+	"dexFiatController/internal/scraping/models"
 )
 
 const (
-	loginURL    = "https://www.paypal.com/signin"
-	activityURL = "https://www.paypal.com/myaccount/transactions/"
-	sendURL     = "https://www.paypal.com/myaccount/transfer/"
-	balanceURL  = "https://www.paypal.com/myaccount/summary/"
-	serviceName = "paypal"
+	loginURL    = "https://app.revolut.com/login"
+	activityURL = "https://app.revolut.com/transactions"
+	sendURL     = "https://app.revolut.com/payments/new"
+	balanceURL  = "https://app.revolut.com/dashboard"
+	serviceName = "revolut"
 )
 
 type Connector struct {
 	sh       *browser.Stagehand
 	browser  *browser.Instance
-	totp     *auth.TOTPClient
 	passkey  *auth.PasskeyManager
 	auth     *auth.Resolver
+	sms      auth.SMSProvider
+	email    auth.EmailProvider
 	cfg      models.ConnectorConfig
 	loggedIn bool
 }
 
-func New(cfg models.ConnectorConfig, inst *browser.Instance, shCfg browser.StagehandConfig, totp *auth.TOTPClient, passkey *auth.PasskeyManager) (*Connector, error) {
+func New(cfg models.ConnectorConfig, inst *browser.Instance, shCfg browser.StagehandConfig, passkey *auth.PasskeyManager, sms auth.SMSProvider, email auth.EmailProvider) (*Connector, error) {
 	registry := browser.NewSelectorRegistry(serviceName)
 	RegisterSelectors(registry)
 	sh := browser.NewStagehand(serviceName, shCfg, registry)
 
-	if totp != nil && cfg.TOTPSecret != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := totp.Register(ctx, serviceName, cfg.TOTPSecret); err != nil {
-			log.Printf("[paypal] warning: failed to register TOTP secret with API: %v", err)
-		}
-	}
-
-	resolver := auth.NewResolver(totp, passkey, nil, nil)
+	resolver := auth.NewResolver(nil, passkey, sms, email)
 
 	return &Connector{
 		sh:      sh,
 		browser: inst,
-		totp:    totp,
 		passkey: passkey,
 		auth:    resolver,
+		sms:     sms,
+		email:   email,
 		cfg:     cfg,
 	}, nil
 }
@@ -71,65 +65,57 @@ func (c *Connector) Login(ctx context.Context) error {
 
 	if c.passkey != nil {
 		if err := c.passkey.Enable(browserCtx); err != nil {
-			log.Printf("[paypal] warning: passkey setup failed: %v", err)
+			log.Printf("[revolut] warning: passkey setup failed: %v", err)
 		}
 	}
 
 	if err := c.sh.Navigate(browserCtx, loginURL); err != nil {
-		return fmt.Errorf("paypal: navigate to login: %w", err)
+		return fmt.Errorf("revolut: navigate to login: %w", err)
 	}
-
 	time.Sleep(2 * time.Second)
 
 	if err := c.sh.WaitVisible(browserCtx, "login_email"); err != nil {
-		return fmt.Errorf("paypal: email field not visible: %w", err)
+		return fmt.Errorf("revolut: email/phone field not visible: %w", err)
 	}
 
-	if err := c.sh.SendKeys(browserCtx, "login_email", c.cfg.Email); err != nil {
-		return fmt.Errorf("paypal: enter email: %w", err)
+	loginID := c.cfg.Email
+	if c.cfg.Phone != "" {
+		loginID = c.cfg.Phone
 	}
 
-	if err := c.sh.Click(browserCtx, "login_next_btn"); err != nil {
-		return fmt.Errorf("paypal: click next: %w", err)
-	}
-
-	time.Sleep(2 * time.Second)
-
-	if err := c.sh.WaitVisible(browserCtx, "login_password"); err != nil {
-		return fmt.Errorf("paypal: password field not visible: %w", err)
+	if err := c.sh.SendKeys(browserCtx, "login_email", loginID); err != nil {
+		return fmt.Errorf("revolut: enter email/phone: %w", err)
 	}
 
 	if err := c.sh.SendKeys(browserCtx, "login_password", c.cfg.Password); err != nil {
-		return fmt.Errorf("paypal: enter password: %w", err)
+		return fmt.Errorf("revolut: enter password: %w", err)
 	}
 
 	if err := c.sh.Click(browserCtx, "login_btn"); err != nil {
-		return fmt.Errorf("paypal: click login: %w", err)
+		return fmt.Errorf("revolut: click login: %w", err)
 	}
-
 	time.Sleep(3 * time.Second)
 
 	if c.requires2FA(browserCtx) {
 		if err := c.handle2FA(browserCtx); err != nil {
-			return fmt.Errorf("paypal: 2fa: %w", err)
+			return fmt.Errorf("revolut: 2fa: %w", err)
 		}
 	}
-
 	time.Sleep(2 * time.Second)
 
 	loggedIn, err := c.checkLoginSuccess(browserCtx)
 	if err != nil {
-		return fmt.Errorf("paypal: login verification: %w", err)
+		return fmt.Errorf("revolut: login verification: %w", err)
 	}
 	if !loggedIn {
-		return fmt.Errorf("paypal: login failed - not on expected page after login")
+		return fmt.Errorf("revolut: login failed")
 	}
 
 	c.loggedIn = true
 	if err := c.maybeRegisterPasskey(browserCtx); err != nil {
-		log.Printf("[paypal] warning: passkey registration skipped: %v", err)
+		log.Printf("[revolut] warning: passkey registration skipped: %v", err)
 	}
-	log.Printf("[paypal] logged in as %s", c.cfg.Email)
+	log.Printf("[revolut] logged in as %s", loginID)
 	return nil
 }
 
@@ -141,8 +127,8 @@ func (c *Connector) requires2FA(ctx context.Context) bool {
 	lower := strings.ToLower(pageTitle)
 	return strings.Contains(lower, "verify") ||
 		strings.Contains(lower, "security") ||
-		strings.Contains(lower, "authentication") ||
-		strings.Contains(lower, "code")
+		strings.Contains(lower, "code") ||
+		strings.Contains(lower, "confirm")
 }
 
 func (c *Connector) handle2FA(ctx context.Context) error {
@@ -152,60 +138,67 @@ func (c *Connector) handle2FA(ctx context.Context) error {
 		if err := c.handlePasskey(ctx); err == nil {
 			return nil
 		}
-		log.Printf("[paypal] passkey 2FA failed, trying next method")
+		log.Printf("[revolut] passkey 2FA failed, trying SMS fallback")
 	}
 
-	if pref.Secondary == connector.TwoFATOTP && c.totp != nil {
-		if err := c.handleTOTP(ctx); err == nil {
+	if pref.Secondary == connector.TwoFASMS && c.sms != nil {
+		if err := c.handleSMS(ctx); err == nil {
 			return nil
 		}
-		log.Printf("[paypal] TOTP 2FA failed")
+		log.Printf("[revolut] SMS 2FA failed, trying email fallback")
+	}
+
+	if pref.Fallback == connector.TwoFAEmail && c.email != nil {
+		if err := c.handleEmail(ctx); err == nil {
+			return nil
+		}
 	}
 
 	code, err := c.auth.ResolveChallenge(ctx, serviceName, pref)
 	if err != nil {
-		return fmt.Errorf("resolve 2fa: %w", err)
+		return err
 	}
-
 	return c.submit2FACode(ctx, code)
 }
 
 func (c *Connector) handlePasskey(ctx context.Context) error {
 	if err := auth.HandlePasskeyAuthentication(ctx, c.passkey); err != nil {
-		return fmt.Errorf("paypal: passkey setup: %w", err)
+		return fmt.Errorf("revolut: passkey setup: %w", err)
 	}
 
 	_ = c.sh.Click(ctx, "passkey_btn")
 	time.Sleep(3 * time.Second)
 
-	log.Printf("[paypal] passkey authentication triggered - virtual authenticator will auto-respond")
+	log.Printf("[revolut] passkey authentication triggered - virtual authenticator will auto-respond")
 	return nil
 }
 
-func (c *Connector) handleTOTP(ctx context.Context) error {
-	_ = c.sh.Click(ctx, "totp_choice_btn")
-	time.Sleep(1 * time.Second)
-
-	code, _, err := c.totp.GenerateCode(ctx, serviceName)
+func (c *Connector) handleSMS(ctx context.Context) error {
+	code, err := c.sms.WaitForCode(ctx, c.cfg.Phone, 120*time.Second)
 	if err != nil {
-		return fmt.Errorf("paypal: totp generate: %w", err)
+		return fmt.Errorf("revolut: wait for sms code: %w", err)
 	}
+	return c.submit2FACode(ctx, code)
+}
 
+func (c *Connector) handleEmail(ctx context.Context) error {
+	code, err := c.email.WaitForCode(ctx, c.cfg.Email, 120*time.Second)
+	if err != nil {
+		return fmt.Errorf("revolut: wait for email code: %w", err)
+	}
 	return c.submit2FACode(ctx, code)
 }
 
 func (c *Connector) submit2FACode(ctx context.Context, code string) error {
-	if err := c.sh.WaitVisible(ctx, "totp_input"); err != nil {
-		return fmt.Errorf("paypal: 2fa input not visible: %w", err)
+	if err := c.sh.WaitVisible(ctx, "sms_code_input"); err != nil {
+		return fmt.Errorf("revolut: 2fa input not visible: %w", err)
 	}
-	if err := c.sh.SendKeys(ctx, "totp_input", code); err != nil {
-		return fmt.Errorf("paypal: enter totp code: %w", err)
+	if err := c.sh.SendKeys(ctx, "sms_code_input", code); err != nil {
+		return fmt.Errorf("revolut: enter 2fa code: %w", err)
 	}
-
-	if err := c.sh.Click(ctx, "totp_submit"); err != nil {
-		return fmt.Errorf("submit totp: %w", err)
+	if err := c.sh.Click(ctx, "sms_submit"); err != nil {
+		return fmt.Errorf("revolut: submit 2fa: %w", err)
 	}
-
 	time.Sleep(2 * time.Second)
 	return nil
 }
@@ -215,10 +208,9 @@ func (c *Connector) checkLoginSuccess(ctx context.Context) (bool, error) {
 	if err := chromedp.Location(&currentURL).Do(ctx); err != nil {
 		return false, err
 	}
-	if strings.Contains(currentURL, "signin") && !strings.Contains(currentURL, "verify") {
-		return false, nil
-	}
-	return true, nil
+	return !strings.Contains(currentURL, "login") &&
+		!strings.Contains(currentURL, "verify") &&
+		!strings.Contains(currentURL, "authenticate"), nil
 }
 
 func (c *Connector) maybeRegisterPasskey(ctx context.Context) error {
@@ -228,7 +220,7 @@ func (c *Connector) maybeRegisterPasskey(ctx context.Context) error {
 
 	exists, err := c.sh.Exists(ctx, "passkey_create_btn")
 	if err != nil {
-		return fmt.Errorf("paypal: detect passkey enrollment prompt: %w", err)
+		return fmt.Errorf("revolut: detect passkey enrollment prompt: %w", err)
 	}
 	if !exists {
 		return nil
@@ -236,15 +228,15 @@ func (c *Connector) maybeRegisterPasskey(ctx context.Context) error {
 
 	host, err := currentHost(ctx)
 	if err != nil {
-		return fmt.Errorf("paypal: determine current host: %w", err)
+		return fmt.Errorf("revolut: determine current host: %w", err)
 	}
 
 	if c.passkey.HasCredentialsForHost(host) {
 		_, err := c.sh.MaybeClick(ctx, "passkey_skip_btn")
 		if err != nil {
-			return fmt.Errorf("paypal: skip duplicate passkey prompt: %w", err)
+			return fmt.Errorf("revolut: skip duplicate passkey prompt: %w", err)
 		}
-		log.Printf("[paypal] passkey already exists for host %s; skipping enrollment prompt", host)
+		log.Printf("[revolut] passkey already exists for host %s; skipping enrollment prompt", host)
 		return nil
 	}
 
@@ -253,10 +245,10 @@ func (c *Connector) maybeRegisterPasskey(ctx context.Context) error {
 	})
 	if err != nil {
 		_, _ = c.sh.MaybeClick(ctx, "passkey_skip_btn")
-		return fmt.Errorf("paypal: register passkey: %w", err)
+		return fmt.Errorf("revolut: register passkey: %w", err)
 	}
 	if registered {
-		log.Printf("[paypal] passkey registered for host %s", host)
+		log.Printf("[revolut] passkey registered for host %s", host)
 	}
 	return nil
 }
@@ -290,7 +282,7 @@ func (c *Connector) IsLoggedIn(ctx context.Context) (bool, error) {
 	if err := chromedp.Location(&currentURL).Do(browserCtx); err != nil {
 		return false, nil
 	}
-	return !strings.Contains(currentURL, "signin"), nil
+	return !strings.Contains(currentURL, "login"), nil
 }
 
 func (c *Connector) Logout(ctx context.Context) error {
@@ -298,29 +290,29 @@ func (c *Connector) Logout(ctx context.Context) error {
 	defer cancel()
 
 	if err := c.sh.Click(browserCtx, "logout_btn"); err != nil {
-		return fmt.Errorf("paypal: click logout: %w", err)
+		return fmt.Errorf("revolut: click logout: %w", err)
 	}
 	c.loggedIn = false
-	log.Printf("[paypal] logged out")
+	log.Printf("[revolut] logged out")
 	return nil
 }
 
 func (c *Connector) GetTransactions(ctx context.Context, opts connector.TransactionQuery) ([]models.Transaction, error) {
 	if !c.loggedIn {
-		return nil, fmt.Errorf("paypal: not logged in")
+		return nil, fmt.Errorf("revolut: not logged in")
 	}
 
 	browserCtx, cancel := c.browser.NewContext(ctx)
 	defer cancel()
 
 	if err := c.sh.Navigate(browserCtx, activityURL); err != nil {
-		return nil, fmt.Errorf("paypal: navigate to activity: %w", err)
+		return nil, fmt.Errorf("revolut: navigate to transactions: %w", err)
 	}
 	time.Sleep(3 * time.Second)
 
 	var txHTML string
 	if err := chromedp.InnerHTML("main", &txHTML, chromedp.ByQuery).Do(browserCtx); err != nil {
-		return nil, fmt.Errorf("paypal: read activity page: %w", err)
+		return nil, fmt.Errorf("revolut: read transactions page: %w", err)
 	}
 
 	transactions := parseTransactions(txHTML)
@@ -334,7 +326,6 @@ func (c *Connector) GetTransactions(ctx context.Context, opts connector.Transact
 		}
 		transactions = filtered
 	}
-
 	if opts.Limit > 0 && len(transactions) > opts.Limit {
 		transactions = transactions[:opts.Limit]
 	}
@@ -344,7 +335,7 @@ func (c *Connector) GetTransactions(ctx context.Context, opts connector.Transact
 
 func parseTransactions(html string) []models.Transaction {
 	var transactions []models.Transaction
-	itemRegex := regexp.MustCompile(`(?i)(transaction-item|activity-line|tx-[a-zA-Z0-9]+)`)
+	itemRegex := regexp.MustCompile(`(?i)(transaction-item|transfer-item|tx-item)`)
 	items := itemRegex.FindAllStringIndex(html, -1)
 
 	for range items {
@@ -370,48 +361,48 @@ func parseTransactions(html string) []models.Transaction {
 
 func (c *Connector) SendPayment(ctx context.Context, req models.SendPaymentRequest) (*models.SendPaymentResult, error) {
 	if !c.loggedIn {
-		return nil, fmt.Errorf("paypal: not logged in")
+		return nil, fmt.Errorf("revolut: not logged in")
 	}
 
 	browserCtx, cancel := c.browser.NewContext(ctx)
 	defer cancel()
 
 	if err := c.sh.Navigate(browserCtx, sendURL); err != nil {
-		return nil, fmt.Errorf("paypal: navigate to send: %w", err)
+		return nil, fmt.Errorf("revolut: navigate to send: %w", err)
 	}
 	time.Sleep(2 * time.Second)
 
 	if err := c.sh.WaitVisible(browserCtx, "send_recipient"); err != nil {
-		return nil, fmt.Errorf("paypal: recipient field not visible: %w", err)
+		return nil, fmt.Errorf("revolut: recipient field not visible: %w", err)
 	}
 
 	if err := c.sh.SendKeys(browserCtx, "send_recipient", req.Recipient); err != nil {
-		return nil, fmt.Errorf("paypal: enter recipient: %w", err)
+		return nil, fmt.Errorf("revolut: enter recipient: %w", err)
 	}
 
 	amountStr := strconv.FormatFloat(req.Amount, 'f', 2, 64)
 	if err := c.sh.SendKeys(browserCtx, "send_amount", amountStr); err != nil {
-		return nil, fmt.Errorf("paypal: enter amount: %w", err)
+		return nil, fmt.Errorf("revolut: enter amount: %w", err)
 	}
 
 	if err := c.sh.Click(browserCtx, "send_submit"); err != nil {
-		return nil, fmt.Errorf("paypal: click send: %w", err)
+		return nil, fmt.Errorf("revolut: click send: %w", err)
 	}
 	time.Sleep(2 * time.Second)
 
 	if err := c.sh.WaitVisible(browserCtx, "send_confirm"); err != nil {
-		return nil, fmt.Errorf("paypal: confirm button not visible: %w", err)
+		return nil, fmt.Errorf("revolut: confirm button not visible: %w", err)
 	}
 
 	if err := c.sh.Click(browserCtx, "send_confirm"); err != nil {
-		return nil, fmt.Errorf("paypal: confirm payment: %w", err)
+		return nil, fmt.Errorf("revolut: confirm payment: %w", err)
 	}
 	time.Sleep(3 * time.Second)
 
-	log.Printf("[paypal] sent %.2f %s to %s", req.Amount, req.Currency, req.Recipient)
+	log.Printf("[revolut] sent %.2f %s to %s", req.Amount, req.Currency, req.Recipient)
 
 	return &models.SendPaymentResult{
-		TransactionID: fmt.Sprintf("paypal-send-%d", time.Now().UnixMilli()),
+		TransactionID: fmt.Sprintf("revolut-send-%d", time.Now().UnixMilli()),
 		Status:        models.TxStatusCompleted,
 		Timestamp:     time.Now(),
 	}, nil
@@ -419,30 +410,30 @@ func (c *Connector) SendPayment(ctx context.Context, req models.SendPaymentReque
 
 func (c *Connector) GetBalance(ctx context.Context, currency string) (*models.Balance, error) {
 	if !c.loggedIn {
-		return nil, fmt.Errorf("paypal: not logged in")
+		return nil, fmt.Errorf("revolut: not logged in")
 	}
 
 	browserCtx, cancel := c.browser.NewContext(ctx)
 	defer cancel()
 
 	if err := c.sh.Navigate(browserCtx, balanceURL); err != nil {
-		return nil, fmt.Errorf("paypal: navigate to summary: %w", err)
+		return nil, fmt.Errorf("revolut: navigate to dashboard: %w", err)
 	}
 	time.Sleep(3 * time.Second)
 
 	var balanceText string
 	if err := c.sh.GetText(browserCtx, "balance_amount", &balanceText); err != nil {
-		return nil, fmt.Errorf("paypal: read balance: %w", err)
+		return nil, fmt.Errorf("revolut: read balance: %w", err)
 	}
 
 	amount, err := parseAmount(balanceText)
 	if err != nil {
-		return nil, fmt.Errorf("paypal: parse balance %q: %w", balanceText, err)
+		return nil, fmt.Errorf("revolut: parse balance %q: %w", balanceText, err)
 	}
 
 	cur := currency
 	if cur == "" {
-		cur = "USD"
+		cur = "EUR"
 	}
 
 	return &models.Balance{

@@ -12,10 +12,10 @@ import (
 
 	"github.com/chromedp/chromedp"
 
-	"dexFiatController/internal/auth"
-	"dexFiatController/internal/browser"
-	"dexFiatController/internal/connector"
-	"dexFiatController/internal/models"
+	"dexFiatController/internal/scraping/auth"
+	"dexFiatController/internal/scraping/browser"
+	"dexFiatController/internal/scraping/connector"
+	"dexFiatController/internal/scraping/models"
 )
 
 const (
