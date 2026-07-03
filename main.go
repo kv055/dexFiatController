@@ -61,7 +61,9 @@ func loadConfig() (controller.Config, func()) {
 		pollInterval = 30 * time.Second
 	}
 
-	cleanup := func() {}
+	cleanup := func() {
+		// no secrets DB opened; nothing to close
+	}
 
 	browserCfg := browser.DefaultConfig()
 	browserCfg.Headless = envOr("HEADLESS", "true") == "true"
