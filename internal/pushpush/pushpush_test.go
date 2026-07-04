@@ -54,15 +54,16 @@ func TestMatcherSingleMatch(t *testing.T) {
 	}
 }
 
-func TestMatcherStructuredFields(t *testing.T) {
+func TestMatcherAmountFromText(t *testing.T) {
 	candidates := []Candidate{
 		{ID: 7, FiatAmount: 42.50, FiatCurrency: "USD", Dex: "RoboSats"},
 	}
 	m := NewMatcher()
-	n := Notification{App: "bank", Amount: 42.50, Currency: "usd"}
+	// Amount and currency are mined from Title+Text, not structured fields.
+	n := Notification{App: "bank", Title: "Payment", Text: "$42.50 received"}
 	candidate, _ := m.Match(n, candidates)
 	if candidate == nil || candidate.ID != 7 {
-		t.Fatalf("expected match on tx 7 via structured fields, got %v", candidate)
+		t.Fatalf("expected match on tx 7 via text-parsed amount, got %v", candidate)
 	}
 }
 
@@ -324,5 +325,190 @@ func TestMarkFiatArrivedStatusGuard(t *testing.T) {
 	}
 	if advanced {
 		t.Fatal("expected second MarkFiatArrived to be a no-op (status guard)")
+	}
+}
+
+// TestExtractJSONObject covers forwarders that wrap the JSON payload in stray
+// whitespace or prefix text (observed MacroDroid bodies).
+func TestExtractJSONObject(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		want  string
+		ok    bool
+	}{
+		{
+			name:  "clean json",
+			input: `{"app":"Revolut","title":"You received €1","text":"Payment received from Kilian Reimar Joergen Voss. Tap for details","time":"1783110191"}`,
+			want:  `{"app":"Revolut","title":"You received €1","text":"Payment received from Kilian Reimar Joergen Voss. Tap for details","time":"1783110191"}`,
+			ok:    true,
+		},
+		{
+			name:  "leading newlines",
+			input: "\n\n" + `{"app":"Revolut","title":"You received €1","text":"x","time":"1783110191"}`,
+			want:  `{"app":"Revolut","title":"You received €1","text":"x","time":"1783110191"}`,
+			ok:    true,
+		},
+		{
+			name:  "prefix junk before json",
+			input: "Kilian Voss has received your bank transfer of €1\n\n" + `{"app":"N26","title":"N26","text":"Kilian Voss has received your bank transfer of €1","time":"1783110200"}`,
+			want:  `{"app":"N26","title":"N26","text":"Kilian Voss has received your bank transfer of €1","time":"1783110200"}`,
+			ok:    true,
+		},
+		{
+			name:  "braces inside string literals",
+			input: `{"app":"N26","title":"N26","text":"You received €2 {promo} from Kilian Voss.","time":"1783110450"}`,
+			want:  `{"app":"N26","title":"N26","text":"You received €2 {promo} from Kilian Voss.","time":"1783110450"}`,
+			ok:    true,
+		},
+		{
+			name:  "invalid json typo falls back",
+			input: `{"app":"Revolut","title":"Transfer sent ✅","text":"You sent €2 to Kilian Reimar Joergen Voss.","date":"time":"1783110442"}`,
+			ok:    false,
+		},
+		{
+			name:  "no object at all",
+			input: "just plain text no json here",
+			ok:    false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := extractJSONObject([]byte(c.input))
+			if ok != c.ok {
+				t.Fatalf("ok: got %v want %v (got=%q)", ok, c.ok, got)
+			}
+			if ok && string(got) != c.want {
+				t.Errorf("extracted: got %q want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestCapturedShapesParse verifies the two real captured notification shapes
+// (Revolut and N26) parse into Notification and yield the expected amount,
+// currency, and sender via the matcher's free-text extraction.
+func TestCapturedShapesParse(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		app      string
+		amount   float64
+		currency string
+		sender   string
+	}{
+		{
+			name:     "revolut received",
+			body:     `{"app":"Revolut","title":"You received €1","text":"Payment received from Kilian Reimar Joergen Voss. Tap for details","time":"1783110191"}`,
+			app:      "Revolut",
+			amount:   1,
+			currency: "EUR",
+			sender:   "Kilian Reimar Joergen Voss",
+		},
+		{
+			name:     "n26 received with sender",
+			body:     `{"app":"N26","title":"N26","text":"You received €2 from Kilian Voss.","time":"1783110450"}`,
+			app:      "N26",
+			amount:   2,
+			currency: "EUR",
+			sender:   "Kilian Voss",
+		},
+		{
+			name:     "n26 received without sender in text",
+			body:     `{"app":"N26","title":"N26","text":"Kilian Voss has received your bank transfer of €1","time":"1783110200"}`,
+			app:      "N26",
+			amount:   1,
+			currency: "EUR",
+			// This N26 notification type names the receiver (the user), not the
+			// sender; the regex still extracts the name, but it is not a real
+			// counterparty sender — matching relies on amount+currency instead.
+			sender: "Kilian Voss",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			obj, ok := extractJSONObject([]byte(c.body))
+			if !ok {
+				t.Fatal("expected extractJSONObject to find the JSON object")
+			}
+			var n Notification
+			if err := json.Unmarshal(obj, &n); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if n.App != c.app {
+				t.Errorf("app: got %q want %q", n.App, c.app)
+			}
+			amt, cur := n.amountAndCurrency()
+			if amt != c.amount || cur != c.currency {
+				t.Errorf("amount/currency: got (%v,%q) want (%v,%q)", amt, cur, c.amount, c.currency)
+			}
+			if got := n.senderName(); got != c.sender {
+				t.Errorf("sender: got %q want %q", got, c.sender)
+			}
+		})
+	}
+}
+
+// forwarders (e.g. MacroDroid) that POST a raw plain-text body with no
+// Content-Type. The whole body becomes the notification text and amount /
+// sender must be mined from it via parseAmount and parseSenderName.
+//
+// Plain text is best-effort: when digits are glued to a name (e.g. "€1Kilian")
+// the word-boundary name regex cannot recover the sender, so such notifications
+// fall back to amount+currency matching and escalate to Telegram when
+// ambiguous. Structured JSON avoids this entirely.
+func TestPlainTextNotificationParsing(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		amount      float64
+		currency    string
+		sender      string
+		senderExact bool // false when the sender is glued to digits and may not extract
+	}{
+		{
+			name:        "revolut style",
+			body:        "You received €1Payment received from Kilian Reimar Joergen Voss. Tap for details",
+			amount:      1,
+			currency:    "EUR",
+			sender:      "Kilian Reimar Joergen Voss",
+			senderExact: true,
+		},
+		{
+			name:        "n26 style names receiver not sender",
+			body:        "N26Kilian Voss has received your bank transfer of €1Kilian Voss has received your bank transfer of €1",
+			amount:      1,
+			currency:    "EUR",
+			sender:      "",
+			senderExact: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var n Notification
+			if json.Valid([]byte(c.body)) {
+				t.Fatal("plain-text body should not parse as JSON")
+			}
+			n = Notification{Text: c.body, App: appFromUserAgent("macrodroid/5.64.11")}
+
+			amt, cur := parseAmount(n.Title + " " + n.Text)
+			if amt != c.amount {
+				t.Errorf("amount: got %v want %v", amt, c.amount)
+			}
+			if cur != c.currency {
+				t.Errorf("currency: got %q want %q", cur, c.currency)
+			}
+			got := parseSenderName(n.Title + " " + n.Text)
+			if c.senderExact {
+				if got != c.sender {
+					t.Errorf("sender: got %q want %q", got, c.sender)
+				}
+			} else if got != "" {
+				t.Errorf("sender: expected empty (glued to digits, will escalate), got %q", got)
+			}
+			if n.App != "macrodroid" {
+				t.Errorf("app: got %q want %q", n.App, "macrodroid")
+			}
+		})
 	}
 }

@@ -24,30 +24,80 @@ var currencyWord = map[string]string{
 	"usd": "USD", "eur": "EUR", "gbp": "GBP",
 }
 
-// parseAmount extracts the first plausible numeric amount from text and its currency
+// parseAmount extracts a plausible numeric amount from text and its currency
 // code (uppercased) if determinable. Returns (0, "") when no amount is found.
+//
+// It scans all candidate matches and prefers one carrying a currency symbol or
+// trailing currency code (e.g. "€1", "100.00 EUR"). Digit runs glued to a
+// preceding letter — such as the "26" in the bank-app name "N26" — are skipped
+// so they don't shadow the real amount.
 func parseAmount(text string) (float64, string) {
-	loc := amountRe.FindStringSubmatchIndex(text)
-	if loc == nil {
-		return 0, ""
-	}
-	match := strings.TrimSpace(text[loc[0]:loc[1]])
-	if match == "" {
+	matches := amountRe.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
 		return 0, ""
 	}
 
-	currency := ""
-	for sym, code := range currencySymbol {
-		if strings.HasPrefix(match, sym) {
-			currency = code
-			break
+	type cand struct {
+		loc      []int
+		currency string
+		hasSym   bool
+	}
+
+	var best *cand
+	var fallback *cand
+	for _, loc := range matches {
+		match := strings.TrimSpace(text[loc[0]:loc[1]])
+		if match == "" {
+			continue
+		}
+		// Locate the first digit inside the match; the regex may start at a
+		// leading space or currency symbol, so loc[0] is not necessarily the
+		// digit position.
+		di := loc[0]
+		for di < loc[1] && (text[di] < '0' || text[di] > '9') {
+			di++
+		}
+		// Skip digit runs immediately preceded by a letter (e.g. "N26", "IBAN123").
+		if di > loc[0] && di > 0 {
+			if r := rune(text[di-1]); (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				continue
+			}
+		}
+
+		currency := ""
+		hasSym := false
+		for sym, code := range currencySymbol {
+			if strings.HasPrefix(match, sym) {
+				currency = code
+				hasSym = true
+				break
+			}
+		}
+		if currency == "" && loc[3] >= 0 {
+			if code, ok := currencyWord[strings.ToLower(strings.TrimSpace(text[loc[2]:loc[3]]))]; ok {
+				currency = code
+			}
+		}
+
+		c := &cand{loc: loc, currency: currency, hasSym: hasSym}
+		if best == nil || (hasSym && !best.hasSym) {
+			best = c
+		}
+		if fallback == nil {
+			fallback = c
 		}
 	}
-	if currency == "" && loc[3] >= 0 {
-		if code, ok := currencyWord[strings.ToLower(strings.TrimSpace(text[loc[2]:loc[3]]))]; ok {
-			currency = code
-		}
+
+	chosen := best
+	if chosen == nil {
+		chosen = fallback
 	}
+	if chosen == nil {
+		return 0, ""
+	}
+
+	match := strings.TrimSpace(text[chosen.loc[0]:chosen.loc[1]])
+	currency := chosen.currency
 
 	cleaned := strings.NewReplacer(",", "", "$", "", "€", "", "£", "", "USD", "", "EUR", "", "GBP", "").Replace(match)
 	cleaned = strings.TrimSpace(cleaned)

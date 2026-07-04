@@ -7,6 +7,7 @@ package pushpush
 
 import (
 	"context"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,10 +30,30 @@ type Server struct {
 	release *ReleaseClient
 	tg      *TelegramClient
 	logger  *Logger
+
+	captureOnly bool
+	capture     *RawCapture
 }
 
-// New wires all pushpush components from cfg and returns a ready server.
+// New wires all pushpush components from cfg and returns a ready server. In capture-only
+// mode (no DATABASE_URL or PUSHPUSH_CAPTURE_ONLY=true) it skips all DB-dependent stores
+// and records every raw request instead.
 func New(cfg Config) (*Server, error) {
+	if cfg.CaptureOnly {
+		cap, err := NewRawCapture(filepath.Join(cfg.DataDir, "capture.jsonl"))
+		if err != nil {
+			return nil, fmt.Errorf("pushpush: open capture log: %w", err)
+		}
+		logger, _ := NewLogger(filepath.Join(cfg.DataDir, "notifications.jsonl"))
+		return &Server{
+			cfg:         cfg,
+			pending:     NewPendingStore(),
+			logger:      logger,
+			captureOnly: true,
+			capture:     cap,
+		}, nil
+	}
+
 	store, err := OpenTxStore(cfg.DatabaseURL)
 	if err != nil {
 		return nil, err
@@ -51,24 +72,31 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	return &Server{
-		cfg:     cfg,
-		store:   store,
-		logs:    logs,
-		rules:   NewRuleStore(filepath.Join(cfg.DataDir, "rules.json")),
-		pending: NewPendingStore(),
-		matcher: NewMatcher(),
-		release: NewReleaseClient(cfg.ReleaseURL, cfg.ReleaseToken, cfg.HTTPClient),
-		tg:      NewTelegramClient(cfg.TelegramToken, cfg.TelegramChatID, cfg.HTTPClient),
-		logger:  logger,
+		cfg:         cfg,
+		store:       store,
+		logs:        logs,
+		rules:       NewRuleStore(filepath.Join(cfg.DataDir, "rules.json")),
+		pending:     NewPendingStore(),
+		matcher:     NewMatcher(),
+		release:     NewReleaseClient(cfg.ReleaseURL, cfg.ReleaseToken, cfg.HTTPClient),
+		tg:          NewTelegramClient(cfg.TelegramToken, cfg.TelegramChatID, cfg.HTTPClient),
+		logger:      logger,
+		captureOnly: false,
 	}, nil
 }
 
 // Run serves HTTP until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /notify", s.handleNotify)
-	mux.HandleFunc("POST /telegram-webhook", s.handleTelegramWebhook)
-	mux.HandleFunc("GET /health", s.handleHealth)
+	if s.captureOnly {
+		// Discovery mode: capture every request verbatim, regardless of path/method.
+		mux.HandleFunc("GET /health", s.handleHealth)
+		mux.HandleFunc("/{path...}", s.handleCapture)
+	} else {
+		mux.HandleFunc("POST /notify", s.handleNotify)
+		mux.HandleFunc("POST /telegram-webhook", s.handleTelegramWebhook)
+		mux.HandleFunc("GET /health", s.handleHealth)
+	}
 
 	srv := &http.Server{
 		Addr:              s.cfg.Addr,
@@ -99,6 +127,9 @@ func (s *Server) Run(ctx context.Context) error {
 // Close releases all underlying resources.
 func (s *Server) Close() error {
 	var errs []error
+	if err := s.capture.Close(); err != nil {
+		errs = append(errs, err)
+	}
 	if err := s.store.Close(); err != nil {
 		errs = append(errs, err)
 	}
@@ -116,6 +147,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// handleCapture records the raw request in capture-only mode and acknowledges it.
+func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
+	s.capture.Record(r)
+	log.Printf("pushpush: captured %s %s %s (len=%d)", r.Method, r.URL.Path, r.RemoteAddr, r.ContentLength)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"captured":true}`))
+}
+
 // handleNotify ingests a payment notification from the bank/provider forwarder. Every
 // decoded request is recorded in fiat_tx_push_logs at status "received" before the
 // pipeline runs, so the row exists regardless of downstream outcome.
@@ -130,13 +170,43 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var n Notification
-	if err := json.Unmarshal(rawBody, &n); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("decode notification: %v", err)})
-		return
+	// Forwarders send a JSON object matching Notification {app,title,text,time}.
+	// Some (e.g. MacroDroid) wrap it in stray leading whitespace or prefix text,
+	// so extract the first valid {...} object rather than requiring the whole
+	// body to be JSON. When no object is found, fall back to treating the raw
+	// payload as the notification text and mine amount/sender from it.
+	jsonObj, isJSON := extractJSONObject(rawBody)
+	if isJSON {
+		if err := json.Unmarshal(jsonObj, &n); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("decode notification: %v", err)})
+			return
+		}
+	} else if len(bytes.TrimSpace(rawBody)) > 0 {
+		n = Notification{Text: string(rawBody)}
+	}
+	// Some forwarders (e.g. MacroDroid) carry no app field; tag by User-Agent so
+	// rules can still key on a stable app identifier.
+	if n.App == "" {
+		n.App = appFromUserAgent(r.Header.Get("User-Agent"))
+	}
+
+	// The fiat_tx_push_logs.raw column is jsonb; store the parsed JSON object when
+	// available, otherwise wrap the plain-text body as a JSON string so the column
+	// always holds valid JSON regardless of the source shape.
+	var rawForLog json.RawMessage
+	if isJSON {
+		rawForLog = json.RawMessage(jsonObj)
+	} else {
+		wrapped, err := json.Marshal(string(rawBody))
+		if err != nil {
+			rawForLog = json.RawMessage(`null`)
+		} else {
+			rawForLog = json.RawMessage(wrapped)
+		}
 	}
 
 	norm := normalize(n.Title + " " + n.Text)
-	logID, logErr := s.logs.Insert(r.Context(), n, json.RawMessage(rawBody), norm)
+	logID, logErr := s.logs.Insert(r.Context(), n, rawForLog, norm)
 	if logErr != nil {
 		log.Printf("pushpush: insert push log: %v", logErr)
 	}
@@ -151,6 +221,72 @@ func (s *Server) authorizeNotify(r *http.Request) bool {
 		return true
 	}
 	return r.Header.Get("X-Webhook-Secret") == s.cfg.NotifySecret
+}
+
+// appFromUserAgent maps forwarder User-Agents to a stable app key. Forwarders
+// such as MacroDroid post plain-text bodies with no app field; tagging them
+// keeps rule learning keyed on a consistent identifier.
+func appFromUserAgent(ua string) string {
+	switch {
+	case strings.HasPrefix(strings.ToLower(ua), "macrodroid/"):
+		return "macrodroid"
+	default:
+		return ""
+	}
+}
+
+// extractJSONObject locates the first valid JSON object ({...}) in raw, tolerating
+// leading whitespace or arbitrary prefix/suffix text that some forwarders (e.g.
+// MacroDroid) emit around the payload. It scans for '{', brace-matches while
+// respecting string literals and escapes, and returns the matching slice only if
+// it is valid JSON. Returns (nil, false) when no valid object is found.
+func extractJSONObject(raw []byte) ([]byte, bool) {
+	for start := 0; start < len(raw); {
+		idx := bytes.IndexByte(raw[start:], '{')
+		if idx < 0 {
+			return nil, false
+		}
+		begin := start + idx
+		depth := 0
+		inStr := false
+		end := -1
+		for i := begin; i < len(raw); i++ {
+			c := raw[i]
+			if inStr {
+				if c == '\\' {
+					i++ // skip escaped char
+					continue
+				}
+				if c == '"' {
+					inStr = false
+				}
+				continue
+			}
+			switch c {
+			case '"':
+				inStr = true
+			case '{':
+				depth++
+			case '}':
+				depth--
+				if depth == 0 {
+					end = i
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end >= 0 {
+			slice := raw[begin : end+1]
+			if json.Valid(slice) {
+				return slice, true
+			}
+		}
+		// Not valid here; continue searching after this '{'.
+		start = begin + 1
+	}
+	return nil, false
 }
 
 // updateLog advances the log row; failures are logged but never block the pipeline.

@@ -5,18 +5,15 @@ import (
 	"strings"
 )
 
-// Notification is the inbound push payment notification. App/Title/Text/Time mirror the
-// prototype payload. Amount/Currency/Sender are optional structured fields a forwarder
-// may include; when absent the matcher derives them from Title+Text.
+// Notification is a payment notification forwarded by a bank/provider app
+// (e.g. Revolut, N26) via a push forwarder such as MacroDroid. The amount,
+// currency, and sender are not provided as structured fields — they are mined
+// from Title+Text via regex (see parseAmount/parseSenderName).
 type Notification struct {
 	App   string `json:"app"`
 	Title string `json:"title"`
 	Text  string `json:"text"`
 	Time  string `json:"time"`
-
-	Amount   float64 `json:"amount,omitempty"`
-	Currency string  `json:"currency,omitempty"`
-	Sender   string  `json:"sender,omitempty"`
 }
 
 // amountTolerance is the maximum fiat-amount delta (in major currency units) for a match.
@@ -104,21 +101,14 @@ func (m *Matcher) Match(notif Notification, candidates []Candidate) (candidate *
 	return nil, amountMatches
 }
 
-// amountAndCurrency returns the notification's amount and currency, parsing Title+Text
-// when the structured fields are missing.
+// amountAndCurrency extracts the amount and currency from Title+Text via regex.
 func (n Notification) amountAndCurrency() (float64, string) {
-	if n.Amount > 0 {
-		return n.Amount, strings.ToUpper(strings.TrimSpace(n.Currency))
-	}
 	a, c := parseAmount(n.Title + " " + n.Text)
 	return a, strings.ToUpper(strings.TrimSpace(c))
 }
 
-// senderName returns the notification's sender, parsing Title+Text when missing.
+// senderName extracts the sender's name from Title+Text via regex.
 func (n Notification) senderName() string {
-	if s := strings.TrimSpace(n.Sender); s != "" {
-		return s
-	}
 	return parseSenderName(n.Title + " " + n.Text)
 }
 

@@ -35,6 +35,11 @@ type Config struct {
 	TelegramWebhookURL string
 
 	HTTPClient *http.Client
+
+	// CaptureOnly runs the server without a database: every request is dumped (body,
+	// headers, query, remote addr) to capture.jsonl for payload-shape discovery. Enabled
+	// when DATABASE_URL is empty or PUSHPUSH_CAPTURE_ONLY=true.
+	CaptureOnly bool
 }
 
 // LoadConfig reads pushpush configuration from environment variables.
@@ -63,6 +68,7 @@ func LoadConfig() Config {
 		TelegramChatID:     strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID")),
 		TelegramWebhookURL: strings.TrimSpace(os.Getenv("PUSHPUSH_TELEGRAM_WEBHOOK_URL")),
 		HTTPClient:         &http.Client{Timeout: timeout},
+		CaptureOnly:        strings.TrimSpace(os.Getenv("DATABASE_URL")) == "" || os.Getenv("PUSHPUSH_CAPTURE_ONLY") == "true",
 	}
 }
 
