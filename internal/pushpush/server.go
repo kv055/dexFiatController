@@ -17,6 +17,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"commons/telegram"
 )
 
 // Server is the pushpush HTTP server and pipeline orchestrator.
@@ -79,7 +81,7 @@ func New(cfg Config) (*Server, error) {
 		pending:     NewPendingStore(),
 		matcher:     NewMatcher(),
 		release:     NewReleaseClient(cfg.ReleaseURL, cfg.ReleaseToken, cfg.HTTPClient),
-		tg:          NewTelegramClient(cfg.TelegramToken, cfg.TelegramChatID, cfg.HTTPClient),
+		tg:          NewTelegramClient(cfg.TelegramCfg.Token, cfg.TelegramCfg.ChatID, cfg.HTTPClient),
 		logger:      logger,
 		captureOnly: false,
 	}, nil
@@ -406,7 +408,7 @@ func (s *Server) escalatePick(ctx context.Context, n Notification, candidates []
 
 // handleTelegramWebhook receives callback-query decisions from Telegram.
 func (s *Server) handleTelegramWebhook(w http.ResponseWriter, r *http.Request) {
-	var u telegramUpdate
+	var u telegram.Update
 	if err := json.NewDecoder(r.Body).Decode(&u); err != nil || u.CallbackQuery == nil {
 		w.WriteHeader(http.StatusOK)
 		return

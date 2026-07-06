@@ -5,6 +5,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"commons/telegram"
 )
 
 // Config holds all runtime configuration for the pushpush server.
@@ -29,10 +31,8 @@ type Config struct {
 	// ReleaseTimeout bounds the webhook HTTP call.
 	ReleaseTimeout time.Duration
 
-	// Telegram escalation. TelegramToken/ChatID empty disables escalation.
-	TelegramToken      string
-	TelegramChatID     string
-	TelegramWebhookURL string
+	// Telegram escalation (TelegramCfg.Token/ChatID empty disables escalation).
+	TelegramCfg telegram.Config
 
 	HTTPClient *http.Client
 
@@ -64,9 +64,7 @@ func LoadConfig() Config {
 		ReleaseURL:         strings.TrimSpace(os.Getenv("PUSHPUSH_DEX_RELEASE_URL")),
 		ReleaseToken:       strings.TrimSpace(os.Getenv("PUSHPUSH_DEX_RELEASE_TOKEN")),
 		ReleaseTimeout:     timeout,
-		TelegramToken:      strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
-		TelegramChatID:     strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID")),
-		TelegramWebhookURL: strings.TrimSpace(os.Getenv("PUSHPUSH_TELEGRAM_WEBHOOK_URL")),
+		TelegramCfg:        telegram.LoadConfig("PUSHPUSH"),
 		HTTPClient:         &http.Client{Timeout: timeout},
 		CaptureOnly:        strings.TrimSpace(os.Getenv("DATABASE_URL")) == "" || os.Getenv("PUSHPUSH_CAPTURE_ONLY") == "true",
 	}
@@ -74,5 +72,5 @@ func LoadConfig() Config {
 
 // EscalationEnabled reports whether Telegram escalation is configured.
 func (c Config) EscalationEnabled() bool {
-	return c.TelegramToken != "" && c.TelegramChatID != ""
+	return c.TelegramCfg.Enabled()
 }
