@@ -4,11 +4,15 @@ ENV GOPROXY=${GOPROXY}
 
 RUN apk add --no-cache git chromium
 
-WORKDIR /app
-COPY go.mod go.sum ./
+WORKDIR /build/dexFiatController
+
+# commons/ is a workspace dependency via `replace commons => ../commons`.
+# The build context is the repo root, so copy it to the parent of this module.
+COPY commons/ ../commons/
+COPY dexFiatController/go.mod dexFiatController/go.sum ./
 RUN go mod download
 
-COPY . .
+COPY dexFiatController/ .
 RUN CGO_ENABLED=0 go build -o /dexFiatController .
 
 FROM alpine:3.19
