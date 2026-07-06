@@ -33,6 +33,10 @@ type Server struct {
 	tg      *TelegramClient
 	logger  *Logger
 
+	// telegramVersion is the config_version baseline used by the hot-reload
+	// poller started in Run to detect shared telegram_settings changes.
+	telegramVersion int64
+
 	captureOnly bool
 	capture     *RawCapture
 }
@@ -73,18 +77,36 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("pushpush: open audit log: %w", err)
 	}
 
-	return &Server{
-		cfg:         cfg,
-		store:       store,
-		logs:        logs,
-		rules:       NewRuleStore(filepath.Join(cfg.DataDir, "rules.json")),
-		pending:     NewPendingStore(),
-		matcher:     NewMatcher(),
-		release:     NewReleaseClient(cfg.ReleaseURL, cfg.ReleaseToken, cfg.HTTPClient),
-		tg:          NewTelegramClient(cfg.TelegramCfg.Token, cfg.TelegramCfg.ChatID, cfg.HTTPClient),
-		logger:      logger,
-		captureOnly: false,
-	}, nil
+	// Seed Telegram config from the shared DB row when present (env fallback
+	// otherwise), and remember the baseline config_version for the hot-reload
+	// poller started in Run.
+	tgCfg := cfg.TelegramCfg
+	var tgVersion int64
+	if seedCfg, v := seedTelegramFromDB(context.Background(), store.DB(), cfg.TelegramCfg); seedCfg.Token != "" {
+		tgCfg = seedCfg
+		tgVersion = v
+	}
+
+	srv := &Server{
+		cfg:               cfg,
+		store:             store,
+		logs:              logs,
+		rules:             NewRuleStore(filepath.Join(cfg.DataDir, "rules.json")),
+		pending:           NewPendingStore(),
+		matcher:           NewMatcher(),
+		release:           NewReleaseClient(cfg.ReleaseURL, cfg.ReleaseToken, cfg.HTTPClient),
+		tg:                NewTelegramClient(tgCfg.Token, tgCfg.ChatID, cfg.HTTPClient),
+		logger:            logger,
+		captureOnly:       false,
+		telegramVersion:   tgVersion,
+	}
+	// Re-register the PUSHPUSH webhook at startup when fully configured.
+	if srv.tg != nil && strings.TrimSpace(tgCfg.WebhookURL) != "" {
+		if err := srv.tg.client().SetWebhook(context.Background(), tgCfg.WebhookURL); err != nil {
+			log.Printf("pushpush: warning: telegram setWebhook: %v", err)
+		}
+	}
+	return srv, nil
 }
 
 // Run serves HTTP until ctx is cancelled.
@@ -98,6 +120,8 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("POST /notify", s.handleNotify)
 		mux.HandleFunc("POST /telegram-webhook", s.handleTelegramWebhook)
 		mux.HandleFunc("GET /health", s.handleHealth)
+		// Hot-reload the shared Telegram bot config from the DB row.
+		go runTelegramSettingsPoller(ctx, s.store.DB(), s.tg, s.cfg.HTTPClient, s.telegramVersion)
 	}
 
 	srv := &http.Server{
