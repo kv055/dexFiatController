@@ -18,7 +18,10 @@ import (
 	"strings"
 	"time"
 
+	"commons/metrics"
 	"commons/telegram"
+
+	"dexFiatController/internal/obs"
 )
 
 // Server is the pushpush HTTP server and pipeline orchestrator.
@@ -39,6 +42,16 @@ type Server struct {
 
 	captureOnly bool
 	capture     *RawCapture
+
+	// metrics is the commons service registry; when set, Run serves /metrics and
+	// wraps the mux with the RED request middleware.
+	metrics *metrics.ServiceRegistry
+}
+
+// WithMetrics attaches the Prometheus service registry to the server.
+func (s *Server) WithMetrics(reg *metrics.ServiceRegistry) *Server {
+	s.metrics = reg
+	return s
 }
 
 // New wires all pushpush components from cfg and returns a ready server. In capture-only
@@ -124,9 +137,15 @@ func (s *Server) Run(ctx context.Context) error {
 		go runTelegramSettingsPoller(ctx, s.store.DB(), s.tg, s.cfg.HTTPClient, s.telegramVersion)
 	}
 
+	var handler http.Handler = mux
+	if s.metrics != nil {
+		mux.Handle("GET /metrics", s.metrics.Handler())
+		handler = s.metrics.Middleware(handler)
+	}
+
 	srv := &http.Server{
 		Addr:              s.cfg.Addr,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -236,6 +255,7 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	if logErr != nil {
 		log.Printf("pushpush: insert push log: %v", logErr)
 	}
+	obs.FiatPushPipeline.WithLabelValues(string(LogReceived)).Inc()
 	s.logger.Log("received", n, map[string]string{"normalized": norm})
 
 	go s.handleNotification(context.Background(), n, norm, logID)
@@ -319,6 +339,11 @@ func extractJSONObject(raw []byte) ([]byte, bool) {
 func (s *Server) updateLog(ctx context.Context, logID int64, u LogUpdate) {
 	if logID == 0 || s.logs == nil {
 		return
+	}
+	// LogReceived is excluded: it is only re-used as a pre-match marker and the
+	// real "received" event is already counted at ingest in handleNotify.
+	if u.Status != "" && u.Status != LogReceived {
+		obs.FiatPushPipeline.WithLabelValues(string(u.Status)).Inc()
 	}
 	if err := s.logs.Update(ctx, logID, u); err != nil {
 		log.Printf("pushpush: update push log %d: %v", logID, err)

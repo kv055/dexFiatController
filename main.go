@@ -8,7 +8,12 @@ import (
 	"syscall"
 	"time"
 
+	"dexFiatController/internal/obs"
 	"dexFiatController/internal/pushpush"
+
+	"commons/logging"
+	"commons/metrics"
+	"commons/telegram"
 
 	scrapingauth "dexFiatController/internal/scraping/auth"
 	scrapingbrowser "dexFiatController/internal/scraping/browser"
@@ -22,6 +27,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Structured JSON logs on stdout (Alloy → Loki). slog.SetDefault also routes
+	// the stdlib log package through the same handler, so existing log.Printf
+	// call sites come out as JSON too.
+	logging.Init("fiatcontroller")
+	metricsReg := metrics.NewServiceRegistry("fiatcontroller")
+	obs.Register(metricsReg.Registry)
+	telegram.RegisterMetrics(metricsReg.Registry)
+
 	// pushpush is the primary fiat-arrival path: it receives pushed payment
 	// notifications, matches them to pending transactions, and triggers BTC release.
 	ppCfg := pushpush.LoadConfig()
@@ -32,6 +45,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to create pushpush server: %v", err)
 	}
+	ppServer.WithMetrics(metricsReg)
 	defer ppServer.Close()
 
 	go func() {
@@ -74,12 +88,14 @@ func runScraping(ctx context.Context) {
 
 	log.Println("logging into all scraping connectors...")
 	if err := fc.LoginAll(ctx); err != nil {
+		obs.ScrapeLoginErrors.Inc()
 		log.Printf("warning: some logins failed: %v", err)
 	}
 
 	log.Println("starting scraping transaction monitor...")
 	go func() {
 		if err := fc.MonitorTransactions(ctx, func(service string, tx scrapingmodels.Transaction) {
+			obs.ScrapeTransactionsSeen.WithLabelValues(service).Inc()
 			log.Printf("[monitor] %s: %s %s %.2f %s -> %s",
 				service, tx.Direction, tx.Status, tx.Amount, tx.Currency, tx.Counterparty)
 		}); err != nil && ctx.Err() == nil {
