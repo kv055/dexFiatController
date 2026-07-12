@@ -457,6 +457,10 @@ func (s *Server) escalatePick(ctx context.Context, n Notification, candidates []
 
 // handleTelegramWebhook receives callback-query decisions from Telegram.
 func (s *Server) handleTelegramWebhook(w http.ResponseWriter, r *http.Request) {
+	if !telegram.WebhookAuthorized(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
 	var u telegram.Update
 	if err := json.NewDecoder(r.Body).Decode(&u); err != nil || u.CallbackQuery == nil {
 		w.WriteHeader(http.StatusOK)
