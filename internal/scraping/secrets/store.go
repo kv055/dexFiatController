@@ -11,6 +11,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"commons/credentialcrypto"
 	"dexFiatController/internal/scraping/auth"
 )
 
@@ -63,6 +64,9 @@ func (s *Store) LoadActiveTOTPSecrets(ctx context.Context) (map[string]string, e
 		if err := rows.Scan(&provider, &secret); err != nil {
 			return nil, fmt.Errorf("scan totp secret: %w", err)
 		}
+		if secret, err = credentialcrypto.Decrypt(secret); err != nil {
+			return nil, fmt.Errorf("decrypt totp secret: %w", err)
+		}
 		secrets[provider] = secret
 	}
 	return secrets, rows.Err()
@@ -83,6 +87,15 @@ func (s *Store) LoadAccounts(ctx context.Context) (map[string]Account, error) {
 		var account Account
 		if err := rows.Scan(&account.Provider, &account.Email, &account.Password, &account.Phone); err != nil {
 			return nil, fmt.Errorf("scan account: %w", err)
+		}
+		if account.Email, err = credentialcrypto.Decrypt(account.Email); err != nil {
+			return nil, fmt.Errorf("decrypt account email: %w", err)
+		}
+		if account.Password, err = credentialcrypto.Decrypt(account.Password); err != nil {
+			return nil, fmt.Errorf("decrypt account password: %w", err)
+		}
+		if account.Phone, err = credentialcrypto.Decrypt(account.Phone); err != nil {
+			return nil, fmt.Errorf("decrypt account phone: %w", err)
 		}
 		accounts[account.Provider] = account
 	}
@@ -136,13 +149,23 @@ func (s *Store) UpsertTOTPSecret(ctx context.Context, provider, secret string) e
 	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("query active totp secret for %s: %w", provider, err)
 	}
+	if err == nil {
+		existingSecret, err = credentialcrypto.Decrypt(existingSecret)
+		if err != nil {
+			return fmt.Errorf("decrypt existing totp secret: %w", err)
+		}
+	}
+	encryptedSecret, err := credentialcrypto.Encrypt(strings.TrimSpace(secret))
+	if err != nil {
+		return fmt.Errorf("encrypt totp secret: %w", err)
+	}
 
 	switch {
 	case err == sql.ErrNoRows:
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO totp_secrets (account_id, secret, is_active)
 			VALUES ($1, $2, TRUE)
-		`, accountID, secret); err != nil {
+		`, accountID, encryptedSecret); err != nil {
 			return fmt.Errorf("insert totp secret for %s: %w", provider, err)
 		}
 	case existingSecret == secret:
@@ -158,7 +181,7 @@ func (s *Store) UpsertTOTPSecret(ctx context.Context, provider, secret string) e
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO totp_secrets (account_id, secret, is_active)
 			VALUES ($1, $2, TRUE)
-		`, accountID, secret); err != nil {
+		`, accountID, encryptedSecret); err != nil {
 			return fmt.Errorf("insert rotated totp secret for %s: %w", provider, err)
 		}
 	}
@@ -190,6 +213,9 @@ func (s *Store) LoadCredentials(ctx context.Context) ([]*auth.PasskeyCredential,
 		var signCount int64
 		if err := rows.Scan(&credentialID, &rpID, &privateKey, &userHandle, &signCount); err != nil {
 			return nil, fmt.Errorf("scan passkey credential: %w", err)
+		}
+		if privateKey, err = credentialcrypto.Decrypt(privateKey); err != nil {
+			return nil, fmt.Errorf("decrypt passkey private key: %w", err)
 		}
 
 		credID, err := base64.StdEncoding.DecodeString(credentialID)
@@ -244,6 +270,10 @@ func (s *Store) SaveCredentials(ctx context.Context, credentials []*auth.Passkey
 		if err != nil {
 			return fmt.Errorf("marshal passkey private key for %s: %w", cred.RPID, err)
 		}
+		encryptedPrivateKey, err := credentialcrypto.Encrypt(base64.StdEncoding.EncodeToString(privKeyBytes))
+		if err != nil {
+			return fmt.Errorf("encrypt passkey private key: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO passkey_credentials (
 				account_id, credential_id, rp_id, private_key_pkcs8, user_handle, sign_count, is_active
@@ -252,7 +282,7 @@ func (s *Store) SaveCredentials(ctx context.Context, credentials []*auth.Passkey
 			accountID,
 			base64.StdEncoding.EncodeToString(cred.CredentialID),
 			cred.RPID,
-			base64.StdEncoding.EncodeToString(privKeyBytes),
+			encryptedPrivateKey,
 			base64.StdEncoding.EncodeToString(cred.UserHandle),
 			cred.SignCount,
 		); err != nil {
@@ -273,7 +303,15 @@ func ensureAccount(ctx context.Context, tx *sql.Tx, account Account) (int64, err
 	}
 
 	var id int64
-	err := tx.QueryRowContext(ctx, `
+	encryptedEmail, err := credentialcrypto.Encrypt(strings.TrimSpace(account.Email))
+	if err != nil {
+		return 0, fmt.Errorf("encrypt account email: %w", err)
+	}
+	encryptedPassword, err := credentialcrypto.Encrypt(strings.TrimSpace(account.Password))
+	if err != nil {
+		return 0, fmt.Errorf("encrypt account password: %w", err)
+	}
+	err = tx.QueryRowContext(ctx, `
 		INSERT INTO accounts (provider, email, password)
 		VALUES ($1, NULLIF($2, ''), NULLIF($3, ''))
 		ON CONFLICT (provider)
@@ -282,7 +320,7 @@ func ensureAccount(ctx context.Context, tx *sql.Tx, account Account) (int64, err
 			password = COALESCE(NULLIF(EXCLUDED.password, ''), accounts.password),
 			updated_at = CURRENT_TIMESTAMP
 		RETURNING id
-	`, account.Provider, account.Email, account.Password).Scan(&id)
+	`, account.Provider, encryptedEmail, encryptedPassword).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("ensure account %s: %w", account.Provider, err)
 	}
