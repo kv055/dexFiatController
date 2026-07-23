@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestParseAmount(t *testing.T) {
@@ -38,102 +39,21 @@ func TestNormalizeStripsAmountAndNames(t *testing.T) {
 	}
 }
 
-func TestMatcherSingleMatch(t *testing.T) {
-	candidates := []Candidate{
-		{ID: 1, FiatAmount: 100.00, FiatCurrency: "EUR", Dex: "HodlHodl"},
-		{ID: 2, FiatAmount: 50.00, FiatCurrency: "EUR", Dex: "Bisq"},
+func TestPaymentSignalProducesNeutralSourceOutput(t *testing.T) {
+	now := time.Now().UTC()
+	notification := Notification{
+		App: "Wise", Title: "You received money",
+		Text: "You received €10.00 from Jane Doe", Time: now.Format(time.RFC3339),
 	}
-	m := NewMatcher()
-	n := Notification{App: "bank", Title: "Received", Text: "€100.00 from Jane Doe"}
-	candidate, ambiguous := m.Match(n, candidates)
-	if candidate == nil || candidate.ID != 1 {
-		t.Fatalf("expected single match on tx 1, got candidate=%v ambiguous=%v", candidate, ambiguous)
+	signal := PaymentSignal(notification, []byte(`{"app":"Wise"}`), "push-event-1", now, 12)
+	if signal.Event.Source != "push" || signal.Event.Provider != "WISE" {
+		t.Fatalf("event = %+v", signal.Event)
 	}
-	if len(ambiguous) != 0 {
-		t.Fatalf("expected no ambiguous, got %v", ambiguous)
+	if signal.Event.AmountMinor != 1000 || signal.Event.Currency != "EUR" {
+		t.Fatalf("amount/currency = %d/%s", signal.Event.AmountMinor, signal.Event.Currency)
 	}
-}
-
-func TestMatcherAmountFromText(t *testing.T) {
-	candidates := []Candidate{
-		{ID: 7, FiatAmount: 42.50, FiatCurrency: "USD", Dex: "RoboSats"},
-	}
-	m := NewMatcher()
-	// Amount and currency are mined from Title+Text, not structured fields.
-	n := Notification{App: "bank", Title: "Payment", Text: "$42.50 received"}
-	candidate, _ := m.Match(n, candidates)
-	if candidate == nil || candidate.ID != 7 {
-		t.Fatalf("expected match on tx 7 via text-parsed amount, got %v", candidate)
-	}
-}
-
-func TestMatcherAmbiguousEscalates(t *testing.T) {
-	candidates := []Candidate{
-		{ID: 1, FiatAmount: 100.00, FiatCurrency: "EUR", Dex: "HodlHodl"},
-		{ID: 2, FiatAmount: 100.00, FiatCurrency: "EUR", Dex: "Bisq"},
-	}
-	m := NewMatcher()
-	// No sender name → cannot disambiguate.
-	n := Notification{App: "bank", Title: "Payment", Text: "100.00 EUR"}
-	candidate, ambiguous := m.Match(n, candidates)
-	if candidate != nil {
-		t.Fatalf("expected no confident candidate, got %v", candidate)
-	}
-	if len(ambiguous) != 2 {
-		t.Fatalf("expected 2 ambiguous, got %d", len(ambiguous))
-	}
-}
-
-func TestMatcherNameDisambiguation(t *testing.T) {
-	c1 := Candidate{ID: 1, FiatAmount: 100.00, FiatCurrency: "EUR", Dex: "HodlHodl",
-		CounterpartyPaymentInfo: json.RawMessage(`{"account_holder":"Jane Doe","iban":"DE00"}`)}
-	c2 := Candidate{ID: 2, FiatAmount: 100.00, FiatCurrency: "EUR", Dex: "Bisq",
-		CounterpartyPaymentInfo: json.RawMessage(`{"name":"Bob Smith"}`)}
-	m := NewMatcher()
-	n := Notification{App: "bank", Title: "Received", Text: "€100.00 from Jane Doe"}
-	candidate, ambiguous := m.Match(n, []Candidate{c1, c2})
-	if candidate == nil || candidate.ID != 1 {
-		t.Fatalf("expected name disambiguation to pick tx 1, got candidate=%v ambiguous=%v", candidate, ambiguous)
-	}
-}
-
-func TestMatcherNoCandidate(t *testing.T) {
-	candidates := []Candidate{
-		{ID: 1, FiatAmount: 100.00, FiatCurrency: "EUR", Dex: "HodlHodl"},
-	}
-	m := NewMatcher()
-	n := Notification{App: "bank", Title: "Received", Text: "€999.00"}
-	candidate, ambiguous := m.Match(n, candidates)
-	if candidate != nil {
-		t.Fatalf("expected no candidate for unmatched amount, got %v", candidate)
-	}
-	if len(ambiguous) != 0 {
-		t.Fatalf("expected no ambiguous for unmatched amount, got %v", ambiguous)
-	}
-}
-
-func TestExtractHolderNameNested(t *testing.T) {
-	raw := json.RawMessage(`{"exchange":"hodlhodl","raw":{"counterparty":{"full_name":"Alice Example"}}}`)
-	if got := extractHolderName(raw); got != "Alice Example" {
-		t.Errorf("extractHolderName nested = %q, want %q", got, "Alice Example")
-	}
-}
-
-func TestNameSimilarity(t *testing.T) {
-	cases := []struct {
-		a, b string
-		want float64
-	}{
-		{"Jane Doe", "jane doe", 1.0},
-		{"Jane Doe", "Doe Jane", 1.0}, // order-independent token overlap
-		{"Jane Doe", "Jane", 0.9},     // contains
-		{"Jane Doe", "Bob Smith", 0},
-	}
-	for _, c := range cases {
-		got := nameSimilarity(c.a, c.b)
-		if abs(got-c.want) > 0.01 {
-			t.Errorf("nameSimilarity(%q,%q) = %v, want %v", c.a, c.b, got, c.want)
-		}
+	if signal.Presentation.App != "Wise" || signal.Presentation.Normalized == "" || signal.AuditID != 12 {
+		t.Fatalf("signal = %+v", signal)
 	}
 }
 
@@ -176,26 +96,8 @@ func TestRuleStoreDenyPrecedence(t *testing.T) {
 	}
 }
 
-func TestPendingStoreAddGet(t *testing.T) {
-	p := NewPendingStore()
-	id := p.Add(PendingEntry{Notification: Notification{App: "bank"}, Kind: pendingClassify})
-	if id == "" {
-		t.Fatal("expected non-empty id")
-	}
-	entry, ok := p.Get(id)
-	if !ok {
-		t.Fatalf("expected to get entry for %s", id)
-	}
-	if entry.Notification.App != "bank" {
-		t.Errorf("got app %q", entry.Notification.App)
-	}
-	if _, ok := p.Get(id); ok {
-		t.Fatal("expected Get to consume the entry")
-	}
-}
-
 // TestLogStoreInsertUpdate exercises the fiat_tx_push_logs round-trip against a real
-// Postgres. Skipped unless PUSHPUSH_TEST_DB is set (same env as TestMarkFiatArrivedStatusGuard).
+// Postgres. Skipped unless PUSHPUSH_TEST_DB is set.
 func TestLogStoreInsertUpdate(t *testing.T) {
 	dsn := os.Getenv("PUSHPUSH_TEST_DB")
 	if dsn == "" {
@@ -279,52 +181,6 @@ func TestLogStoreInsertUpdate(t *testing.T) {
 	}
 	if errMsg.Valid {
 		t.Errorf("expected error cleared, got %q", errMsg.String)
-	}
-}
-
-// TestMarkFiatArrivedStatusGuard exercises the idempotent status guard against a real
-// Postgres. It is skipped unless PUSHPUSH_TEST_DB is set (points at a DB that already has
-// the transactions schema). Follows the project's pure-unit-test default: no forced DB.
-func TestMarkFiatArrivedStatusGuard(t *testing.T) {
-	dsn := os.Getenv("PUSHPUSH_TEST_DB")
-	if dsn == "" {
-		t.Skip("set PUSHPUSH_TEST_DB to run the Postgres integration test")
-	}
-	store, err := OpenTxStore(dsn)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer store.Close()
-
-	ctx := context.Background()
-	// Insert a minimal pending row.
-	var id uint
-	err = store.db.QueryRowContext(ctx, `
-		INSERT INTO transactions (direction, fiat_amount, fiat_currency, status, transaction_complete)
-		VALUES ($1, $2, $3, $4, FALSE)
-		RETURNING id
-	`, directionBUY, 12.34, "EUR", statusDexPositionTaken).Scan(&id)
-	if err != nil {
-		t.Fatalf("seed transaction: %v", err)
-	}
-	defer func() {
-		_, _ = store.db.ExecContext(ctx, `DELETE FROM transactions WHERE id = $1`, id)
-	}()
-
-	advanced, err := store.MarkFiatArrived(ctx, id, json.RawMessage(`{"source":"test"}`))
-	if err != nil {
-		t.Fatalf("first MarkFiatArrived: %v", err)
-	}
-	if !advanced {
-		t.Fatal("expected first MarkFiatArrived to advance the row")
-	}
-	// Second call must not advance (status is no longer DexPositionTaken).
-	advanced, err = store.MarkFiatArrived(ctx, id, json.RawMessage(`{"source":"test"}`))
-	if err != nil {
-		t.Fatalf("second MarkFiatArrived: %v", err)
-	}
-	if advanced {
-		t.Fatal("expected second MarkFiatArrived to be a no-op (status guard)")
 	}
 }
 

@@ -151,3 +151,30 @@ func TestDecodeRejectsOversizedAndMalformedMail(t *testing.T) {
 		t.Fatal("malformed message accepted")
 	}
 }
+
+func TestSignalExposesVerificationForNeutralCaller(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := PaymentEmailConfig{
+		Mode: Active, ActivationUID: 4,
+		ActivationTime: now.Add(-time.Hour),
+	}
+	valid := Signal(
+		wiseFixture("You received\r\nAmount: 10.00 EUR\r\nFrom: Jane Doe\r\nReference: x"),
+		5, cfg, now,
+	)
+	if !valid.Validation.Accepted || valid.Event.Provider != "WISE" || valid.Rollout.UID != 5 {
+		t.Fatalf("valid signal = %+v", valid)
+	}
+
+	raw := strings.ReplaceAll(
+		string(wiseFixture("You received\r\nAmount: 10.00 EUR\r\nFrom: Jane Doe\r\nReference: x")),
+		"header.d=wise.com", "header.d=attacker.test",
+	)
+	rejected := Signal([]byte(raw), 6, cfg, now)
+	if rejected.Validation.Accepted || rejected.Validation.Reason == "" {
+		t.Fatalf("rejected signal validation = %+v", rejected.Validation)
+	}
+	if rejected.Event.SourceEventID == "" || rejected.Event.RawMessageHash == "" {
+		t.Fatalf("rejected signal lost audit identity: %+v", rejected.Event)
+	}
+}

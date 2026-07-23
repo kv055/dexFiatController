@@ -48,14 +48,18 @@ func (t *TelegramClient) client() *telegram.Client {
 	return t.inner
 }
 
+func (t *TelegramClient) Enabled() bool {
+	return t != nil && t.client() != nil
+}
+
 // SendClassify asks whether a notification is an incoming payment, with yes/no buttons
 // carrying callback_data "yes:<id>" / "no:<id>".
-func (t *TelegramClient) SendClassify(ctx context.Context, id string, n Notification) error {
+func (t *TelegramClient) SendClassify(ctx context.Context, id string, presentation paymentevents.Presentation) error {
 	inner := t.client()
 	if inner == nil {
 		return fmt.Errorf("telegram client not configured")
 	}
-	text := fmt.Sprintf("New %s notification:\n\n%s\n%s\n\nIs this a payment received?", n.App, n.Title, n.Text)
+	text := fmt.Sprintf("New %s notification:\n\n%s\n%s\n\nIs this a payment received?", presentation.App, presentation.Title, presentation.Text)
 	kb := telegram.InlineKeyboard{}
 	kb.Row(
 		telegram.Button("Yes — payment", "yes:"+id),
@@ -66,12 +70,12 @@ func (t *TelegramClient) SendClassify(ctx context.Context, id string, n Notifica
 
 // SendPick asks a human to choose which pending transaction a payment corresponds to.
 // Each button carries callback_data "pick:<id>:<txID>" (kept short for the 64-byte limit).
-func (t *TelegramClient) SendPick(ctx context.Context, id string, n Notification, candidates []paymentevents.Candidate) error {
+func (t *TelegramClient) SendPick(ctx context.Context, id string, presentation paymentevents.Presentation, candidates []paymentevents.Candidate) error {
 	inner := t.client()
 	if inner == nil {
 		return fmt.Errorf("telegram client not configured")
 	}
-	text := fmt.Sprintf("Ambiguous payment via %s:\n\n%s\n%s\n\nWhich transaction is this?", n.App, n.Title, n.Text)
+	text := fmt.Sprintf("Ambiguous payment via %s:\n\n%s\n%s\n\nWhich transaction is this?", presentation.App, presentation.Title, presentation.Text)
 	kb := telegram.InlineKeyboard{}
 	for _, c := range candidates {
 		label := fmt.Sprintf("tx %d: %.2f %s (%s)", c.ID, c.FiatAmount, strings.ToUpper(c.FiatCurrency), c.Dex)

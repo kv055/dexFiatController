@@ -56,8 +56,9 @@ dexFiatController/
 +-- internal/models/                # Transaction, payment, balance, config models
 +-- internal/notifications/         # Client for dexUnifiedApi payment notifications
 +-- internal/paymentemail/          # IMAP reader, MIME safety, and exact email templates
++-- internal/paymentingestion/      # Neutral legitimacy, matching, and escalation caller
 +-- internal/paymentevents/         # Source-neutral matching, channel gate, and release
-+-- internal/pushpush/              # Push HTTP adapter and Telegram presentation
++-- internal/pushpush/              # Push HTTP transport and Telegram presentation
 +-- internal/secrets/               # Shared Postgres secret/account store
 +-- services/totp-api/              # TOTP microservice
 +-- Dockerfile
@@ -131,6 +132,13 @@ Push notifications and authenticated Wise/PayPal email are normalized into
 transaction's canonical `payment_method`; amount/currency are mandatory and sender plus
 reference are disambiguation evidence. Raw MIME stays in Maddy and Postgres stores only
 the parsed fields and SHA-256.
+
+The source packages stop at a shared `paymentevents.InboundSignal` contract.
+`paymentemail` supplies MIME/template/DKIM evidence and `pushpush` supplies the
+authenticated HTTP payload. `paymentingestion.Coordinator` is the only caller that
+accepts those outputs and decides whether to reject, match, record without action, or
+open a Telegram classification/selection. Telegram decisions return to that same
+coordinator and cannot bypass channel confirmation.
 
 Each selected account channel is mandatory. An account configured with `push,email`
 advances only after both channels confirm the same transaction; `push` or `email` alone

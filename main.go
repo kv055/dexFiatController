@@ -35,8 +35,8 @@ func main() {
 	obs.Register(metricsReg.Registry)
 	telegram.RegisterMetrics(metricsReg.Registry)
 
-	// pushpush is the primary fiat-arrival path: it receives pushed payment
-	// notifications, matches them to pending transactions, and triggers BTC release.
+	// PushPush is the HTTP transport for pushed payment notifications. Both push
+	// and email signals are evaluated by the neutral payment-ingestion caller.
 	ppCfg := pushpush.LoadConfig()
 	if ppCfg.Addr == "" {
 		ppCfg.Addr = ":8080"

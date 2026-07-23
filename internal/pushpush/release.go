@@ -35,8 +35,9 @@ func NewReleaseClient(url, token string, client *http.Client) *ReleaseClient {
 }
 
 // Release posts the release webhook for txID. 200 (already_released) and 202 (accepted)
-// are success; 503 (queue full) is retried with backoff. It is safe to call after a
-// non-advancing MarkFiatArrived — the dexMmController webhook is itself idempotent.
+// are success; 503 (queue full) is retried with backoff. The neutral payment
+// coordinator calls it only after the atomic channel gate advances a transaction;
+// the dexMmController webhook is independently idempotent.
 func (r *ReleaseClient) Release(ctx context.Context, txID uint) error {
 	if r == nil {
 		return fmt.Errorf("pushpush: release client not configured")

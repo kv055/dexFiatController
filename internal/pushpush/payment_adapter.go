@@ -8,11 +8,13 @@ import (
 	"dexFiatController/internal/paymentevents"
 )
 
-// PaymentEvent is an alias to the neutral domain model. PushPush only adapts
-// its source-specific Notification into this type.
+// PaymentEvent is an alias retained for pending audit structures and tests.
 type PaymentEvent = paymentevents.PaymentEvent
 
-func notificationEvent(n Notification, raw []byte, sourceEventID string, received time.Time) PaymentEvent {
+// PaymentSignal converts a transport-level push notification into the neutral
+// source output consumed by paymentingestion. It does not classify, persist,
+// match, escalate, or release the signal.
+func PaymentSignal(n Notification, raw []byte, sourceEventID string, received time.Time, auditID int64) paymentevents.InboundSignal {
 	amount, currency := n.amountAndCurrency()
 	if strings.TrimSpace(sourceEventID) == "" {
 		sourceEventID = paymentevents.EventIDFromBytes(raw)
@@ -21,17 +23,25 @@ func notificationEvent(n Notification, raw []byte, sourceEventID string, receive
 	if providerTime.IsZero() {
 		providerTime = received.UTC()
 	}
-	return PaymentEvent{
-		Source:            paymentevents.SourcePush,
-		Provider:          providerFromNotification(n),
-		SourceEventID:     strings.TrimSpace(sourceEventID),
-		Sender:            n.senderName(),
-		AmountMinor:       int64(math.Round(amount * 100)),
-		Currency:          strings.ToUpper(strings.TrimSpace(currency)),
-		Description:       strings.TrimSpace(n.Title + " " + n.Text),
-		ProviderTimestamp: providerTime,
-		ReceivedTimestamp: received.UTC(),
-		RawMessageHash:    paymentevents.EventIDFromBytes(raw),
+	return paymentevents.InboundSignal{
+		Event: PaymentEvent{
+			Source:            paymentevents.SourcePush,
+			Provider:          providerFromNotification(n),
+			SourceEventID:     strings.TrimSpace(sourceEventID),
+			Sender:            n.senderName(),
+			AmountMinor:       int64(math.Round(amount * 100)),
+			Currency:          strings.ToUpper(strings.TrimSpace(currency)),
+			Description:       strings.TrimSpace(n.Title + " " + n.Text),
+			ProviderTimestamp: providerTime,
+			ReceivedTimestamp: received.UTC(),
+			RawMessageHash:    paymentevents.EventIDFromBytes(raw),
+		},
+		Presentation: paymentevents.Presentation{
+			App: n.App, Title: n.Title, Text: n.Text,
+			Normalized: normalize(n.Title + " " + n.Text),
+		},
+		Validation: paymentevents.Validation{Accepted: true},
+		AuditID:    auditID,
 	}
 }
 

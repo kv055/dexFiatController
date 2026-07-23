@@ -67,6 +67,48 @@ type ParsedMessage struct {
 	Subject string
 }
 
+// Signal converts a raw mailbox message into the neutral source output. The
+// parser reports verification evidence; paymentingestion owns the acceptance
+// and rollout decision.
+func Signal(raw []byte, uid uint32, cfg PaymentEmailConfig, received time.Time) paymentevents.InboundSignal {
+	if cfg.Mode == Capture {
+		event, err := CaptureMessage(raw, uid, received)
+		validation := paymentevents.Validation{Accepted: err == nil}
+		if err != nil {
+			validation.Reason = err.Error()
+		}
+		return paymentevents.InboundSignal{
+			Event: event, Validation: validation,
+			Rollout: paymentevents.Rollout{Mode: string(Capture), UID: uid},
+		}
+	}
+	message, err := ParseMessage(raw, received)
+	if message.Event.SourceEventID == "" {
+		message.Event.Source = paymentevents.SourceEmail
+		message.Event.Provider = "unknown"
+		message.Event.SourceEventID = fmt.Sprintf("uid:%d:%s", uid, paymentevents.EventIDFromBytes(raw))
+		message.Event.ReceivedTimestamp = received.UTC()
+		message.Event.RawMessageHash = paymentevents.EventIDFromBytes(raw)
+		message.Event.AuthenticationOutcome = "parse_failed"
+	}
+	validation := paymentevents.Validation{Accepted: err == nil}
+	if err != nil {
+		validation.Reason = err.Error()
+	}
+	return paymentevents.InboundSignal{
+		Event: message.Event,
+		Presentation: paymentevents.Presentation{
+			App: message.Event.Provider, Title: message.Subject,
+			Text: message.Event.Description,
+		},
+		Validation: validation,
+		Rollout: paymentevents.Rollout{
+			Mode: string(cfg.Mode), UID: uid,
+			ActivationUID: cfg.ActivationUID, ActivationTime: cfg.ActivationTime,
+		},
+	}
+}
+
 // Capture decodes only safe metadata and a hash. It never template-parses an
 // amount or emits release-capable fields.
 func CaptureMessage(raw []byte, uid uint32, received time.Time) (paymentevents.PaymentEvent, error) {

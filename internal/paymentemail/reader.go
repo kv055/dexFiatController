@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"dexFiatController/internal/paymentevents"
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 )
@@ -130,10 +131,10 @@ func (h *EmailHealth) LastSuccess() time.Time {
 type EmailReader struct {
 	cfg    PaymentEmailConfig
 	health *EmailHealth
-	handle func(context.Context, uint32, []byte) error
+	handle func(context.Context, paymentevents.InboundSignal) error
 }
 
-func NewEmailReader(cfg PaymentEmailConfig, health *EmailHealth, handle func(context.Context, uint32, []byte) error) (*EmailReader, error) {
+func NewEmailReader(cfg PaymentEmailConfig, health *EmailHealth, handle func(context.Context, paymentevents.InboundSignal) error) (*EmailReader, error) {
 	if cfg.Mode == "" {
 		cfg.Mode = Capture
 	}
@@ -304,5 +305,5 @@ func (r *EmailReader) fetchAndIngest(ctx context.Context, imapClient *client.Cli
 	if len(raw) == 0 {
 		return fmt.Errorf("UID %d has no body", uid)
 	}
-	return r.handle(ctx, uid, raw)
+	return r.handle(ctx, Signal(raw, uid, r.cfg, time.Now().UTC()))
 }

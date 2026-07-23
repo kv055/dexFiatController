@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,18 +23,17 @@ import (
 	"dexFiatController/internal/obs"
 	"dexFiatController/internal/paymentemail"
 	"dexFiatController/internal/paymentevents"
+	"dexFiatController/internal/paymentingestion"
 )
 
-// Server is the pushpush HTTP server and pipeline orchestrator.
+// Server is the PushPush HTTP transport and Telegram presentation adapter.
 type Server struct {
-	cfg     Config
-	store   *TxStore
-	logs    *LogStore
-	events  *paymentevents.Processor
-	rules   *RuleStore
-	pending *PendingStore
-	tg      *TelegramClient
-	logger  *Logger
+	cfg       Config
+	store     *TxStore
+	logs      *LogStore
+	ingestion *paymentingestion.Coordinator
+	tg        *TelegramClient
+	logger    *Logger
 
 	// telegramVersion is the config_version baseline used by the hot-reload
 	// poller started in Run to detect shared telegram_settings changes.
@@ -77,7 +77,6 @@ func New(cfg Config) (*Server, error) {
 		logger, _ := NewLogger(filepath.Join(cfg.DataDir, "notifications.jsonl"))
 		return &Server{
 			cfg:         cfg,
-			pending:     NewPendingStore(),
 			logger:      logger,
 			captureOnly: true,
 			capture:     cap,
@@ -124,14 +123,14 @@ func New(cfg Config) (*Server, error) {
 
 	emailHealth := &paymentemail.EmailHealth{}
 	release := NewReleaseClient(cfg.ReleaseURL, cfg.ReleaseToken, cfg.HTTPClient)
+	processor := paymentevents.NewProcessor(eventStore, release)
+	rules := NewRuleStore(filepath.Join(cfg.DataDir, "rules.json"))
+	telegramClient := NewTelegramClient(tgCfg.Token, tgCfg.ChatID, cfg.HTTPClient)
 	srv := &Server{
 		cfg:             cfg,
 		store:           store,
 		logs:            logs,
-		events:          paymentevents.NewProcessor(eventStore, release),
-		rules:           NewRuleStore(filepath.Join(cfg.DataDir, "rules.json")),
-		pending:         NewPendingStore(),
-		tg:              NewTelegramClient(tgCfg.Token, tgCfg.ChatID, cfg.HTTPClient),
+		tg:              telegramClient,
 		logger:          logger,
 		captureOnly:     false,
 		telegramVersion: tgVersion,
@@ -139,8 +138,11 @@ func New(cfg Config) (*Server, error) {
 		heartbeatLogs:   heartbeatLogs,
 		emailHealth:     emailHealth,
 	}
-	emailIngestor := paymentemail.NewIngestor(cfg.PaymentEmail, srv.events, srv)
-	emailReader, err := paymentemail.NewEmailReader(cfg.PaymentEmail, emailHealth, emailIngestor.Handle)
+	srv.ingestion = paymentingestion.New(processor, rules, telegramClient, srv)
+	emailReader, err := paymentemail.NewEmailReader(cfg.PaymentEmail, emailHealth, func(ctx context.Context, signal paymentevents.InboundSignal) error {
+		_, handleErr := srv.ingestion.Handle(ctx, signal)
+		return handleErr
+	})
 	if err != nil {
 		_ = store.Close()
 		_ = logger.Close()
@@ -408,19 +410,23 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	obs.FiatPushPipeline.WithLabelValues(string(LogReceived)).Inc()
 	s.logger.Log("received", n, map[string]string{"normalized": norm})
 
-	event := notificationEvent(n, rawBody, r.Header.Get("X-Event-ID"), time.Now())
-	eventID, duplicate, eventErr := s.events.Record(r.Context(), event, "received")
+	signal := PaymentSignal(n, rawBody, r.Header.Get("X-Event-ID"), time.Now(), logID)
+	receipt, eventErr := s.ingestion.Accept(r.Context(), signal)
 	if eventErr != nil {
 		s.updateLog(r.Context(), logID, LogUpdate{Status: LogMarkError, Error: eventErr.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "persist payment event"})
 		return
 	}
-	if duplicate {
-		writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "duplicate": true, "event_id": eventID, "log_id": logID})
+	if receipt.Duplicate {
+		writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "duplicate": true, "event_id": receipt.EventID, "log_id": logID})
 		return
 	}
-	go s.handleNotification(context.Background(), n, norm, logID, event, eventID)
-	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "event_id": eventID, "log_id": logID})
+	go func() {
+		if err := s.ingestion.Process(context.Background(), receipt); err != nil {
+			log.Printf("payment ingestion: process push signal: %v", err)
+		}
+	}()
+	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "event_id": receipt.EventID, "log_id": logID})
 }
 
 func (s *Server) authorizeNotify(r *http.Request) bool {
@@ -518,131 +524,61 @@ func (s *Server) updateLog(ctx context.Context, logID int64, u LogUpdate) {
 	}
 }
 
-// handleNotification is the classification → match → release pipeline.
-func (s *Server) handleNotification(ctx context.Context, n Notification, norm string, logID int64, event PaymentEvent, eventID int64) {
-	allowed, denied := s.rules.Match(n.App, norm)
-	switch {
-	case denied:
-		s.logger.Log("denied", n, norm)
-		s.updateLog(ctx, logID, LogUpdate{Status: LogDenied, RuleDecision: "deny"})
-		_ = s.events.Update(ctx, eventID, "denied", nil, "")
-		return
-	case allowed:
-		s.logger.Log("allowed", n, norm)
-		s.updateLog(ctx, logID, LogUpdate{Status: LogReceived, RuleDecision: "allow"}) // pre-match marker
-		s.attemptMatch(ctx, n, logID, event, eventID)
-		return
+// Report maps neutral coordinator outcomes onto the existing PushPush audit log.
+// It contains no legitimacy, matching, escalation, or release decisions.
+func (s *Server) Report(ctx context.Context, signal paymentevents.InboundSignal, outcome paymentingestion.Outcome) {
+	n := Notification{
+		App: signal.Presentation.App, Title: signal.Presentation.Title,
+		Text: signal.Presentation.Text,
+		Time: signal.Event.ProviderTimestamp.Format(time.RFC3339),
 	}
-
-	// Unknown shape → ask a human whether this is a payment at all.
-	if !s.cfg.EscalationEnabled() {
-		s.logger.Log("unclassified_no_escalation", n, norm)
-		s.updateLog(ctx, logID, LogUpdate{Status: LogUnclassifiedNoEscalation})
-		_ = s.events.Update(ctx, eventID, "unclassified", nil, "")
+	update := LogUpdate{MatchedTxID: outcome.TxID, TelegramPendingID: outcome.PendingID, Error: outcome.Reason}
+	action := string(outcome.Kind)
+	switch outcome.Kind {
+	case paymentingestion.OutcomeDenied:
+		update.Status, update.RuleDecision = LogDenied, "deny"
+	case paymentingestion.OutcomeUnmatched, paymentingestion.OutcomeRejected:
+		update.Status = LogUnmatched
+	case paymentingestion.OutcomeAwaitingClassify:
+		update.Status = LogEscalatedClassify
+	case paymentingestion.OutcomeAwaitingSelection:
+		update.Status = LogEscalatedPick
+	case paymentingestion.OutcomeNoClassification:
+		update.Status = LogUnclassifiedNoEscalation
+	case paymentingestion.OutcomeNoSelection:
+		update.Status = LogAmbiguousNoEscalation
+	case paymentingestion.OutcomeListError:
+		update.Status = LogListError
+	case paymentingestion.OutcomeTelegramError:
+		update.Status = LogTelegramError
+	case paymentingestion.OutcomeUserAllowed:
+		update.Status, update.RuleDecision = LogUserAllowed, "allow"
+	case paymentingestion.OutcomeUserDenied:
+		update.Status, update.RuleDecision = LogUserDenied, "deny"
+	case paymentingestion.OutcomePicked, paymentingestion.OutcomeWaitingChannels:
+		update.Status = LogPicked
+	case paymentingestion.OutcomeConfirmationError:
+		update.Status = LogMarkError
+	case paymentingestion.OutcomeReleaseError:
+		update.Status = LogReleaseError
+	case paymentingestion.OutcomeReleased:
+		update.Status = LogReleased
+	case paymentingestion.OutcomeDuplicateConfirmation:
 		return
-	}
-	id := s.pending.Add(PendingEntry{Notification: n, Event: event, EventID: eventID, Normalized: norm, Kind: pendingClassify, LogID: logID})
-	s.logger.Log("escalated_classify", n, map[string]string{"id": id, "normalized": norm})
-	s.updateLog(ctx, logID, LogUpdate{Status: LogEscalatedClassify, TelegramPendingID: id})
-	_ = s.events.Update(ctx, eventID, "awaiting_classification", nil, "")
-	if err := s.tg.SendClassify(ctx, id, n); err != nil {
-		s.logger.Log("telegram_send_error", n, err.Error())
-		s.updateLog(ctx, logID, LogUpdate{Status: LogTelegramError, Error: err.Error()})
-	}
-}
-
-// attemptMatch runs the matcher and, on a confident single hit, advances the row and
-// triggers release.
-func (s *Server) attemptMatch(ctx context.Context, n Notification, logID int64, event PaymentEvent, eventID int64) {
-	candidate, ambiguous, candidates, err := s.events.Match(ctx, event, time.Now())
-	if err != nil {
-		s.logger.Log("list_pending_error", n, err.Error())
-		s.updateLog(ctx, logID, LogUpdate{Status: LogListError, Error: err.Error()})
-		return
-	}
-
-	switch {
-	case candidate != nil:
-		s.confirmAndRelease(ctx, n, event, eventID, *candidate, logID)
-	case len(ambiguous) > 0:
-		s.escalatePick(ctx, n, event, eventID, ambiguous, logID)
 	default:
-		s.logger.Log("unmatched", n, nil)
-		s.updateLog(ctx, logID, LogUpdate{Status: LogUnmatched})
-		status, reason := eventEligibilityStatus(event, candidates)
-		_ = s.events.Update(ctx, eventID, status, nil, reason)
-	}
-}
-
-func eventEligibilityStatus(event PaymentEvent, candidates []paymentevents.Candidate) (string, string) {
-	return paymentevents.EligibilityStatus(event, candidates, time.Now())
-}
-
-// confirmAndRelease presents the outcome of the neutral channel-and-release
-// coordinator in PushPush's existing logs.
-func (s *Server) confirmAndRelease(ctx context.Context, n Notification, event PaymentEvent, eventID int64, c paymentevents.Candidate, logID int64) {
-	txID := c.ID
-	result, err := s.events.Complete(ctx, event, eventID, c)
-	if err != nil {
-		status := LogMarkError
-		action := "confirmation_error"
-		if result.Advanced {
-			status = LogReleaseError
-			action = "release_error"
+		// Capture, shadow, and duplicate-email outcomes have no push log row.
+		if signal.AuditID == 0 {
+			return
 		}
-		s.logger.Log(action, n, map[string]any{"tx_id": txID, "error": err.Error()})
-		s.updateLog(ctx, logID, LogUpdate{Status: status, MatchedTxID: &txID, Error: err.Error()})
-		return
+		update.Status = LogReceived
 	}
-	if result.State == paymentevents.CompletionWaiting {
-		s.logger.Log("awaiting_channels", n, map[string]any{"tx_id": txID, "required": result.Required, "present": result.Present})
-		s.updateLog(ctx, logID, LogUpdate{Status: LogPicked, MatchedTxID: &txID})
-		return
+	details := map[string]any{
+		"tx_id": outcome.TxID, "pending_id": outcome.PendingID,
+		"required": outcome.Required, "present": outcome.Present,
+		"reason": outcome.Reason,
 	}
-	if result.State == paymentevents.CompletionDuplicate {
-		return
-	}
-	s.logger.Log("released", n, map[string]any{"tx_id": txID})
-	s.updateLog(ctx, logID, LogUpdate{Status: LogReleased, MatchedTxID: &txID})
-	log.Printf("pushpush: released tx %d (%.2f %s) via %s", txID, c.FiatAmount, c.FiatCurrency, n.App)
-}
-
-// ConfirmEmail is the presentation callback used by paymentemail after the
-// neutral processor has produced a single candidate.
-func (s *Server) ConfirmEmail(ctx context.Context, event paymentevents.PaymentEvent, eventID int64, candidate paymentevents.Candidate, subject string) {
-	notification := Notification{
-		App: event.Provider, Title: subject, Text: event.Description,
-		Time: event.ProviderTimestamp.Format(time.RFC3339),
-	}
-	s.confirmAndRelease(ctx, notification, event, eventID, candidate, 0)
-}
-
-// AmbiguousEmail delegates a neutral ambiguous result to the existing Telegram
-// selection UI; selection still records only the email channel.
-func (s *Server) AmbiguousEmail(ctx context.Context, event paymentevents.PaymentEvent, eventID int64, candidates []paymentevents.Candidate, subject string) {
-	notification := Notification{
-		App: event.Provider, Title: subject, Text: event.Description,
-		Time: event.ProviderTimestamp.Format(time.RFC3339),
-	}
-	s.escalatePick(ctx, notification, event, eventID, candidates, 0)
-}
-
-// escalatePick asks a human to choose among ambiguous amount+currency matches.
-func (s *Server) escalatePick(ctx context.Context, n Notification, event PaymentEvent, eventID int64, candidates []paymentevents.Candidate, logID int64) {
-	if !s.cfg.EscalationEnabled() {
-		s.logger.Log("ambiguous_no_escalation", n, map[string]int{"candidates": len(candidates)})
-		s.updateLog(ctx, logID, LogUpdate{Status: LogAmbiguousNoEscalation})
-		_ = s.events.Update(ctx, eventID, "ambiguous", nil, "")
-		return
-	}
-	id := s.pending.Add(PendingEntry{Notification: n, Event: event, EventID: eventID, Candidates: candidates, Kind: pendingPick, LogID: logID})
-	s.logger.Log("escalated_pick", n, map[string]any{"id": id, "candidates": candidateIDs(candidates)})
-	s.updateLog(ctx, logID, LogUpdate{Status: LogEscalatedPick, TelegramPendingID: id})
-	_ = s.events.Update(ctx, eventID, "awaiting_selection", nil, "")
-	if err := s.tg.SendPick(ctx, id, n, candidates); err != nil {
-		s.logger.Log("telegram_send_error", n, err.Error())
-		s.updateLog(ctx, logID, LogUpdate{Status: LogTelegramError, Error: err.Error()})
-	}
+	s.logger.Log(action, n, details)
+	s.updateLog(ctx, signal.AuditID, update)
 }
 
 // handleTelegramWebhook receives callback-query decisions from Telegram.
@@ -682,83 +618,29 @@ func (s *Server) handleTelegramWebhook(w http.ResponseWriter, r *http.Request) {
 
 // handleClassifyDecision processes a yes/no answer to "is this a payment?".
 func (s *Server) handleClassifyDecision(ctx context.Context, callbackID, decision, id string) {
-	entry, ok := s.pending.Get(id)
-	if !ok {
+	if err := s.ingestion.DecideClassification(ctx, id, decision == "yes"); err != nil {
 		s.tg.AnswerCallback(ctx, callbackID, "Already handled or expired.")
 		return
 	}
 	if decision == "yes" {
-		s.rules.Add(entry.Notification.App, entry.Normalized, true)
-		s.logger.Log("user_allowed", entry.Notification, entry.Normalized)
-		s.updateLog(ctx, entry.LogID, LogUpdate{Status: LogUserAllowed, RuleDecision: "allow"})
 		s.tg.AnswerCallback(ctx, callbackID, "Whitelisted.")
-		s.attemptMatch(ctx, entry.Notification, entry.LogID, entry.Event, entry.EventID)
 		return
 	}
-	s.rules.Add(entry.Notification.App, entry.Normalized, false)
-	s.logger.Log("user_denied", entry.Notification, entry.Normalized)
-	s.updateLog(ctx, entry.LogID, LogUpdate{Status: LogUserDenied, RuleDecision: "deny"})
-	_ = s.events.Update(ctx, entry.EventID, "denied", nil, "")
 	s.tg.AnswerCallback(ctx, callbackID, "Blacklisted.")
 }
 
 // handlePickDecision processes a human's choice among ambiguous candidates.
 func (s *Server) handlePickDecision(ctx context.Context, callbackID, id, txIDStr string) {
-	entry, ok := s.pending.Get(id)
-	if !ok {
-		s.tg.AnswerCallback(ctx, callbackID, "Already handled or expired.")
-		return
-	}
-	var picked *paymentevents.Candidate
-	for i := range entry.Candidates {
-		if fmt.Sprintf("%d", entry.Candidates[i].ID) == txIDStr {
-			picked = &entry.Candidates[i]
-			break
-		}
-	}
-	if picked == nil {
+	txID, err := strconv.ParseUint(txIDStr, 10, 64)
+	if err != nil {
 		s.tg.AnswerCallback(ctx, callbackID, "Candidate not found.")
 		return
 	}
-	txID := picked.ID
-	s.updateLog(ctx, entry.LogID, LogUpdate{Status: LogPicked, MatchedTxID: &txID})
-	s.confirmAndRelease(ctx, entry.Notification, entry.Event, entry.EventID, *picked, entry.LogID)
-	s.tg.AnswerCallback(ctx, callbackID, fmt.Sprintf("Confirmed tx %d; release remains channel-gated.", picked.ID))
-}
-
-// buildEvidence is the jsonb stored in transactions.dex_fiat_arrival as proof of arrival.
-func buildEvidence(n Notification, c Candidate) json.RawMessage {
-	amount, currency := n.amountAndCurrency()
-	doc := map[string]any{
-		"source":      "pushpush",
-		"app":         n.App,
-		"title":       n.Title,
-		"text":        n.Text,
-		"sender":      n.senderName(),
-		"amount":      amount,
-		"currency":    strings.ToUpper(currency),
-		"normalized":  normalize(n.Title + " " + n.Text),
-		"received_at": time.Now().UTC().Format(time.RFC3339),
-		"matched_tx": map[string]any{
-			"id":            c.ID,
-			"fiat_amount":   c.FiatAmount,
-			"fiat_currency": c.FiatCurrency,
-			"dex":           c.Dex,
-		},
+	if err := s.ingestion.DecideSelection(ctx, id, uint(txID)); err != nil {
+		s.tg.AnswerCallback(ctx, callbackID, "Already handled, expired, or candidate not found.")
+		return
 	}
-	b, err := json.Marshal(doc)
-	if err != nil {
-		return json.RawMessage(`{}`)
-	}
-	return b
-}
-
-func candidateIDs(cs []paymentevents.Candidate) []uint {
-	ids := make([]uint, 0, len(cs))
-	for _, c := range cs {
-		ids = append(ids, c.ID)
-	}
-	return ids
+	s.tg.AnswerCallback(ctx, callbackID, fmt.Sprintf("Confirmed tx %d; release remains channel-gated.", txID))
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
