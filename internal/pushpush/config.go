@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"commons/telegram"
+	"dexFiatController/internal/paymentemail"
 )
 
 // Config holds all runtime configuration for the pushpush server.
@@ -16,6 +17,13 @@ type Config struct {
 	// NotifySecret gates POST /notify via the X-Webhook-Secret header. Empty disables
 	// the check (not recommended in production).
 	NotifySecret string
+
+	// HeartbeatSecret authorizes phone heartbeat requests. When empty,
+	// LoadConfig falls back to NotifySecret so a MacroDroid installation only
+	// needs one shared secret by default.
+	HeartbeatSecret string
+	// HeartbeatMaxAge is how long a received heartbeat keeps the phone online.
+	HeartbeatMaxAge time.Duration
 
 	// DataDir is where rules.json and notifications.jsonl are persisted.
 	DataDir string
@@ -40,6 +48,8 @@ type Config struct {
 	// headers, query, remote addr) to capture.jsonl for payload-shape discovery. Enabled
 	// when DATABASE_URL is empty or PUSHPUSH_CAPTURE_ONLY=true.
 	CaptureOnly bool
+
+	PaymentEmail paymentemail.PaymentEmailConfig
 }
 
 // LoadConfig reads pushpush configuration from environment variables.
@@ -55,18 +65,32 @@ func LoadConfig() Config {
 			timeout = d
 		}
 	}
+	heartbeatMaxAge := 15 * time.Minute
+	if v := strings.TrimSpace(os.Getenv("PUSHPUSH_HEARTBEAT_MAX_AGE")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			heartbeatMaxAge = d
+		}
+	}
+	notifySecret := strings.TrimSpace(os.Getenv("PUSHPUSH_NOTIFY_SECRET"))
+	heartbeatSecret := strings.TrimSpace(os.Getenv("PUSHPUSH_HEARTBEAT_SECRET"))
+	if heartbeatSecret == "" {
+		heartbeatSecret = notifySecret
+	}
 
 	return Config{
-		Addr:               strings.TrimSpace(os.Getenv("PUSHPUSH_ADDR")),
-		NotifySecret:       strings.TrimSpace(os.Getenv("PUSHPUSH_NOTIFY_SECRET")),
-		DataDir:            dataDir,
-		DatabaseURL:        strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		ReleaseURL:         strings.TrimSpace(os.Getenv("PUSHPUSH_DEX_RELEASE_URL")),
-		ReleaseToken:       strings.TrimSpace(os.Getenv("PUSHPUSH_DEX_RELEASE_TOKEN")),
-		ReleaseTimeout:     timeout,
-		TelegramCfg:        telegram.LoadConfig("PUSHPUSH"),
-		HTTPClient:         &http.Client{Timeout: timeout},
-		CaptureOnly:        strings.TrimSpace(os.Getenv("DATABASE_URL")) == "" || os.Getenv("PUSHPUSH_CAPTURE_ONLY") == "true",
+		Addr:            strings.TrimSpace(os.Getenv("PUSHPUSH_ADDR")),
+		NotifySecret:    notifySecret,
+		HeartbeatSecret: heartbeatSecret,
+		HeartbeatMaxAge: heartbeatMaxAge,
+		DataDir:         dataDir,
+		DatabaseURL:     strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		ReleaseURL:      strings.TrimSpace(os.Getenv("PUSHPUSH_DEX_RELEASE_URL")),
+		ReleaseToken:    strings.TrimSpace(os.Getenv("PUSHPUSH_DEX_RELEASE_TOKEN")),
+		ReleaseTimeout:  timeout,
+		TelegramCfg:     telegram.LoadConfig("PUSHPUSH"),
+		HTTPClient:      &http.Client{Timeout: timeout},
+		CaptureOnly:     strings.TrimSpace(os.Getenv("DATABASE_URL")) == "" || os.Getenv("PUSHPUSH_CAPTURE_ONLY") == "true",
+		PaymentEmail:    paymentemail.LoadConfig(),
 	}
 }
 

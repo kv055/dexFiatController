@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"commons/telegram"
+	"dexFiatController/internal/paymentevents"
 )
 
 // TelegramClient sends escalation messages via the shared commons/telegram client.
@@ -65,7 +66,7 @@ func (t *TelegramClient) SendClassify(ctx context.Context, id string, n Notifica
 
 // SendPick asks a human to choose which pending transaction a payment corresponds to.
 // Each button carries callback_data "pick:<id>:<txID>" (kept short for the 64-byte limit).
-func (t *TelegramClient) SendPick(ctx context.Context, id string, n Notification, candidates []Candidate) error {
+func (t *TelegramClient) SendPick(ctx context.Context, id string, n Notification, candidates []paymentevents.Candidate) error {
 	inner := t.client()
 	if inner == nil {
 		return fmt.Errorf("telegram client not configured")

@@ -11,22 +11,22 @@ import (
 type LogStatus string
 
 const (
-	LogReceived                  LogStatus = "received"
-	LogDenied                    LogStatus = "denied"
-	LogUnmatched                 LogStatus = "unmatched"
-	LogEscalatedClassify         LogStatus = "escalated_classify"
-	LogEscalatedPick             LogStatus = "escalated_pick"
-	LogUnclassifiedNoEscalation  LogStatus = "unclassified_no_escalation"
-	LogAmbiguousNoEscalation     LogStatus = "ambiguous_no_escalation"
-	LogReleased                  LogStatus = "released"
-	LogAlreadyReleased           LogStatus = "already_released"
-	LogReleaseError              LogStatus = "release_error"
-	LogMarkError                 LogStatus = "mark_error"
-	LogListError                 LogStatus = "list_error"
-	LogTelegramError             LogStatus = "telegram_error"
-	LogUserAllowed               LogStatus = "user_allowed"
-	LogUserDenied                LogStatus = "user_denied"
-	LogPicked                    LogStatus = "picked"
+	LogReceived                 LogStatus = "received"
+	LogDenied                   LogStatus = "denied"
+	LogUnmatched                LogStatus = "unmatched"
+	LogEscalatedClassify        LogStatus = "escalated_classify"
+	LogEscalatedPick            LogStatus = "escalated_pick"
+	LogUnclassifiedNoEscalation LogStatus = "unclassified_no_escalation"
+	LogAmbiguousNoEscalation    LogStatus = "ambiguous_no_escalation"
+	LogReleased                 LogStatus = "released"
+	LogAlreadyReleased          LogStatus = "already_released"
+	LogReleaseError             LogStatus = "release_error"
+	LogMarkError                LogStatus = "mark_error"
+	LogListError                LogStatus = "list_error"
+	LogTelegramError            LogStatus = "telegram_error"
+	LogUserAllowed              LogStatus = "user_allowed"
+	LogUserDenied               LogStatus = "user_denied"
+	LogPicked                   LogStatus = "picked"
 )
 
 // fiatTxPushLogsSchema mirrors dexUnifiedApi/db/schema/19_fiat_tx_push_logs.sql so the
@@ -81,7 +81,14 @@ func NewLogStore(db *sql.DB) (*LogStore, error) {
 		return nil, fmt.Errorf("pushpush: log store requires a non-nil db")
 	}
 	if _, err := db.Exec(fiatTxPushLogsSchema); err != nil {
-		return nil, fmt.Errorf("pushpush: ensure fiat_tx_push_logs schema: %w", err)
+		// In production the restricted fiat-controller role has DML-only access;
+		// dexUnifiedApi owns schema creation. Retain the self-bootstrap path for
+		// local/dev databases, but accept a pre-existing table when DDL is denied.
+		var exists bool
+		checkErr := db.QueryRow(`SELECT to_regclass('public.fiat_tx_push_logs') IS NOT NULL`).Scan(&exists)
+		if checkErr != nil || !exists {
+			return nil, fmt.Errorf("pushpush: ensure fiat_tx_push_logs schema: %w", err)
+		}
 	}
 	return &LogStore{db: db}, nil
 }
@@ -116,11 +123,11 @@ func (l *LogStore) Insert(ctx context.Context, n Notification, raw json.RawMessa
 // pipeline. Carry-forward fields (MatchedTxID, RuleDecision, TelegramPendingID) are only
 // set when non-nil/non-empty; Error overwrites (and clears when empty).
 type LogUpdate struct {
-	Status             LogStatus
-	MatchedTxID        *uint
-	RuleDecision       string
-	TelegramPendingID  string
-	Error              string
+	Status            LogStatus
+	MatchedTxID       *uint
+	RuleDecision      string
+	TelegramPendingID string
+	Error             string
 }
 
 // Update advances a log row to a new stage. Carry-forward fields preserve their previous

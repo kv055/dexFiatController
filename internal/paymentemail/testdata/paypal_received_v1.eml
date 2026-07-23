@@ -1,0 +1,12 @@
+From: PayPal <service@paypal.com>
+To: payments@example.test
+Subject: You've got money
+Message-ID: <sanitized-paypal-v1@example.test>
+Date: Thu, 23 Jul 2026 10:16:00 +0000
+Authentication-Results: mx.example.test; dkim=pass header.d=paypal.com; spf=pass; dmarc=pass
+Content-Type: text/plain; charset=utf-8
+
+Payment received
+Amount: USD 67.89
+From: John Example
+Transaction ID: PP-SANITIZED-123

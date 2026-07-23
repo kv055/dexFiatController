@@ -1,13 +1,11 @@
-// Package pushpush implements the push-based fiat-arrival server. It receives payment
-// notifications, matches them to pending bid transactions in the shared transactions
-// table, advances matched rows to DexFiatHasArrived, and triggers BTC release on
-// dexMmController. Ambiguous or unclassified notifications are escalated to a human via
-// Telegram.
+// Package pushpush implements the HTTP adapter for push-based fiat-arrival
+// notifications and the Telegram presentation flow. Source-neutral matching,
+// channel correlation and release coordination live in package paymentevents.
 package pushpush
 
 import (
-	"context"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +20,8 @@ import (
 	"commons/telegram"
 
 	"dexFiatController/internal/obs"
+	"dexFiatController/internal/paymentemail"
+	"dexFiatController/internal/paymentevents"
 )
 
 // Server is the pushpush HTTP server and pipeline orchestrator.
@@ -29,10 +29,9 @@ type Server struct {
 	cfg     Config
 	store   *TxStore
 	logs    *LogStore
+	events  *paymentevents.Processor
 	rules   *RuleStore
 	pending *PendingStore
-	matcher *Matcher
-	release *ReleaseClient
 	tg      *TelegramClient
 	logger  *Logger
 
@@ -40,12 +39,20 @@ type Server struct {
 	// poller started in Run to detect shared telegram_settings changes.
 	telegramVersion int64
 
-	captureOnly bool
-	capture     *RawCapture
+	captureOnly   bool
+	capture       *RawCapture
+	heartbeat     *HeartbeatStore
+	heartbeatLogs heartbeatLogger
+	emailHealth   *paymentemail.EmailHealth
+	emailReader   *paymentemail.EmailReader
 
 	// metrics is the commons service registry; when set, Run serves /metrics and
 	// wraps the mux with the RED request middleware.
 	metrics *metrics.ServiceRegistry
+}
+
+type heartbeatLogger interface {
+	Insert(ctx context.Context, deviceID, remoteAddr, userAgent string) error
 }
 
 // WithMetrics attaches the Prometheus service registry to the server.
@@ -58,6 +65,10 @@ func (s *Server) WithMetrics(reg *metrics.ServiceRegistry) *Server {
 // mode (no DATABASE_URL or PUSHPUSH_CAPTURE_ONLY=true) it skips all DB-dependent stores
 // and records every raw request instead.
 func New(cfg Config) (*Server, error) {
+	heartbeat, err := NewHeartbeatStore(filepath.Join(cfg.DataDir, "phone-heartbeat.json"))
+	if err != nil {
+		return nil, fmt.Errorf("pushpush: open heartbeat store: %w", err)
+	}
 	if cfg.CaptureOnly {
 		cap, err := NewRawCapture(filepath.Join(cfg.DataDir, "capture.jsonl"))
 		if err != nil {
@@ -70,6 +81,7 @@ func New(cfg Config) (*Server, error) {
 			logger:      logger,
 			captureOnly: true,
 			capture:     cap,
+			heartbeat:   heartbeat,
 		}, nil
 	}
 
@@ -79,6 +91,16 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	logs, err := NewLogStore(store.DB())
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	eventStore, err := paymentevents.NewEventStore(store.DB())
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	heartbeatLogs, err := NewHeartbeatLogStore(store.DB())
 	if err != nil {
 		_ = store.Close()
 		return nil, err
@@ -100,19 +122,32 @@ func New(cfg Config) (*Server, error) {
 		tgVersion = v
 	}
 
+	emailHealth := &paymentemail.EmailHealth{}
+	release := NewReleaseClient(cfg.ReleaseURL, cfg.ReleaseToken, cfg.HTTPClient)
 	srv := &Server{
-		cfg:               cfg,
-		store:             store,
-		logs:              logs,
-		rules:             NewRuleStore(filepath.Join(cfg.DataDir, "rules.json")),
-		pending:           NewPendingStore(),
-		matcher:           NewMatcher(),
-		release:           NewReleaseClient(cfg.ReleaseURL, cfg.ReleaseToken, cfg.HTTPClient),
-		tg:                NewTelegramClient(tgCfg.Token, tgCfg.ChatID, cfg.HTTPClient),
-		logger:            logger,
-		captureOnly:       false,
-		telegramVersion:   tgVersion,
+		cfg:             cfg,
+		store:           store,
+		logs:            logs,
+		events:          paymentevents.NewProcessor(eventStore, release),
+		rules:           NewRuleStore(filepath.Join(cfg.DataDir, "rules.json")),
+		pending:         NewPendingStore(),
+		tg:              NewTelegramClient(tgCfg.Token, tgCfg.ChatID, cfg.HTTPClient),
+		logger:          logger,
+		captureOnly:     false,
+		telegramVersion: tgVersion,
+		heartbeat:       heartbeat,
+		heartbeatLogs:   heartbeatLogs,
+		emailHealth:     emailHealth,
 	}
+	emailIngestor := paymentemail.NewIngestor(cfg.PaymentEmail, srv.events, srv)
+	emailReader, err := paymentemail.NewEmailReader(cfg.PaymentEmail, emailHealth, emailIngestor.Handle)
+	if err != nil {
+		_ = store.Close()
+		_ = logger.Close()
+		return nil, fmt.Errorf("pushpush: configure payment email reader: %w", err)
+	}
+	srv.emailReader = emailReader
+	srv.cfg.PaymentEmail = emailReader.Config()
 	// Re-register the PUSHPUSH webhook at startup when fully configured.
 	if srv.tg != nil && strings.TrimSpace(tgCfg.WebhookURL) != "" {
 		if err := srv.tg.client().SetWebhook(context.Background(), tgCfg.WebhookURL); err != nil {
@@ -128,13 +163,20 @@ func (s *Server) Run(ctx context.Context) error {
 	if s.captureOnly {
 		// Discovery mode: capture every request verbatim, regardless of path/method.
 		mux.HandleFunc("GET /health", s.handleHealth)
+		mux.HandleFunc("POST /phone-heartbeat", s.handlePhoneHeartbeat)
+		mux.HandleFunc("GET /phone-heartbeat", s.handlePhoneHeartbeatStatus)
+		mux.HandleFunc("GET /notification-health", s.handleNotificationHealth)
 		mux.HandleFunc("/{path...}", s.handleCapture)
 	} else {
 		mux.HandleFunc("POST /notify", s.handleNotify)
+		mux.HandleFunc("POST /phone-heartbeat", s.handlePhoneHeartbeat)
+		mux.HandleFunc("GET /phone-heartbeat", s.handlePhoneHeartbeatStatus)
+		mux.HandleFunc("GET /notification-health", s.handleNotificationHealth)
 		mux.HandleFunc("POST /telegram-webhook", s.handleTelegramWebhook)
 		mux.HandleFunc("GET /health", s.handleHealth)
 		// Hot-reload the shared Telegram bot config from the DB row.
 		go runTelegramSettingsPoller(ctx, s.store.DB(), s.tg, s.cfg.HTTPClient, s.telegramVersion)
+		go s.emailReader.Run(ctx)
 	}
 
 	var handler http.Handler = mux
@@ -172,14 +214,20 @@ func (s *Server) Run(ctx context.Context) error {
 // Close releases all underlying resources.
 func (s *Server) Close() error {
 	var errs []error
-	if err := s.capture.Close(); err != nil {
-		errs = append(errs, err)
+	if s.capture != nil {
+		if err := s.capture.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	if err := s.store.Close(); err != nil {
-		errs = append(errs, err)
+	if s.store != nil {
+		if err := s.store.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	if err := s.logger.Close(); err != nil {
-		errs = append(errs, err)
+	if s.logger != nil {
+		if err := s.logger.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("pushpush: close errors: %v", errs)
@@ -190,6 +238,108 @@ func (s *Server) Close() error {
 // handleHealth is a liveness probe.
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handlePhoneHeartbeat records a check-in from the phone running MacroDroid.
+func (s *Server) handlePhoneHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeHeartbeat(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	var request struct {
+		DeviceID string `json:"device_id"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+			return
+		}
+	}
+	if !validDeviceID(request.DeviceID) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "device_id is required and must be at most 128 characters"})
+		return
+	}
+	deviceID := strings.TrimSpace(request.DeviceID)
+	if s.heartbeatLogs == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "heartbeat database logging unavailable"})
+		return
+	}
+	if err := s.heartbeatLogs.Insert(r.Context(), deviceID, r.RemoteAddr, r.UserAgent()); err != nil {
+		log.Printf("pushpush: record phone heartbeat in database: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "record heartbeat"})
+		return
+	}
+	heartbeat, err := s.heartbeat.Record(deviceID, time.Now())
+	if err != nil {
+		log.Printf("pushpush: record phone heartbeat: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "record heartbeat"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"online": true, "device_id": heartbeat.DeviceID, "last_seen": heartbeat.LastSeen})
+}
+
+// handlePhoneHeartbeatStatus reports whether the most recent heartbeat is fresh.
+func (s *Server) handlePhoneHeartbeatStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeHeartbeat(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	heartbeat := s.heartbeat.Latest()
+	online := !heartbeat.LastSeen.IsZero() && time.Since(heartbeat.LastSeen) <= s.cfg.HeartbeatMaxAge
+	writeJSON(w, http.StatusOK, map[string]any{
+		"online":          online,
+		"device_id":       heartbeat.DeviceID,
+		"last_seen":       heartbeat.LastSeen,
+		"max_age_seconds": int64(s.cfg.HeartbeatMaxAge.Seconds()),
+	})
+}
+
+// handleNotificationHealth reports every channel selected on the account linked
+// to a canonical payment method. It shares heartbeat authentication so the
+// pre-trade checker does not need another controller secret.
+func (s *Server) handleNotificationHealth(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeHeartbeat(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if s.store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "database unavailable"})
+		return
+	}
+	method := strings.TrimSpace(r.URL.Query().Get("payment_method"))
+	if method == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "payment_method is required"})
+		return
+	}
+	var provider, channels string
+	err := s.store.DB().QueryRowContext(r.Context(), `
+		SELECT a.provider, COALESCE(array_to_string(a.notification_channels::text[], ','), '')
+		FROM payment_methods pm
+		LEFT JOIN bank_accounts ba ON ba.id=pm.bank_account_id
+		JOIN accounts a ON a.id=COALESCE(pm.account_id, ba.account_id)
+		WHERE lower(pm.name)=lower($1) AND pm.is_active
+	`, method).Scan(&provider, &channels)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "active linked payment account not found"})
+		return
+	}
+	selected := paymentevents.SplitChannels(channels)
+	heartbeat := s.heartbeat.Latest()
+	pushHealthy := !heartbeat.LastSeen.IsZero() && time.Since(heartbeat.LastSeen) <= s.cfg.HeartbeatMaxAge
+	emailLast := time.Time{}
+	if s.emailHealth != nil {
+		emailLast = s.emailHealth.LastSuccess()
+	}
+	emailHealthy := !emailLast.IsZero() && time.Since(emailLast) <= s.cfg.PaymentEmail.HealthMaxAge
+	writeJSON(w, http.StatusOK, map[string]any{
+		"payment_method":    method,
+		"provider":          provider,
+		"selected_channels": selected,
+		"channels": map[string]any{
+			"push":  map[string]any{"healthy": pushHealthy, "last_success": heartbeat.LastSeen},
+			"email": map[string]any{"healthy": emailHealthy, "last_success": emailLast},
+		},
+	})
 }
 
 // handleCapture records the raw request in capture-only mode and acknowledges it.
@@ -258,8 +408,19 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	obs.FiatPushPipeline.WithLabelValues(string(LogReceived)).Inc()
 	s.logger.Log("received", n, map[string]string{"normalized": norm})
 
-	go s.handleNotification(context.Background(), n, norm, logID)
-	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "log_id": logID})
+	event := notificationEvent(n, rawBody, r.Header.Get("X-Event-ID"), time.Now())
+	eventID, duplicate, eventErr := s.events.Record(r.Context(), event, "received")
+	if eventErr != nil {
+		s.updateLog(r.Context(), logID, LogUpdate{Status: LogMarkError, Error: eventErr.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "persist payment event"})
+		return
+	}
+	if duplicate {
+		writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "duplicate": true, "event_id": eventID, "log_id": logID})
+		return
+	}
+	go s.handleNotification(context.Background(), n, norm, logID, event, eventID)
+	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "event_id": eventID, "log_id": logID})
 }
 
 func (s *Server) authorizeNotify(r *http.Request) bool {
@@ -267,6 +428,13 @@ func (s *Server) authorizeNotify(r *http.Request) bool {
 		return true
 	}
 	return r.Header.Get("X-Webhook-Secret") == s.cfg.NotifySecret
+}
+
+func (s *Server) authorizeHeartbeat(r *http.Request) bool {
+	if s.cfg.HeartbeatSecret == "" {
+		return true
+	}
+	return r.Header.Get("X-Webhook-Secret") == s.cfg.HeartbeatSecret
 }
 
 // appFromUserAgent maps forwarder User-Agents to a stable app key. Forwarders
@@ -351,17 +519,18 @@ func (s *Server) updateLog(ctx context.Context, logID int64, u LogUpdate) {
 }
 
 // handleNotification is the classification → match → release pipeline.
-func (s *Server) handleNotification(ctx context.Context, n Notification, norm string, logID int64) {
+func (s *Server) handleNotification(ctx context.Context, n Notification, norm string, logID int64, event PaymentEvent, eventID int64) {
 	allowed, denied := s.rules.Match(n.App, norm)
 	switch {
 	case denied:
 		s.logger.Log("denied", n, norm)
 		s.updateLog(ctx, logID, LogUpdate{Status: LogDenied, RuleDecision: "deny"})
+		_ = s.events.Update(ctx, eventID, "denied", nil, "")
 		return
 	case allowed:
 		s.logger.Log("allowed", n, norm)
 		s.updateLog(ctx, logID, LogUpdate{Status: LogReceived, RuleDecision: "allow"}) // pre-match marker
-		s.attemptMatch(ctx, n, logID)
+		s.attemptMatch(ctx, n, logID, event, eventID)
 		return
 	}
 
@@ -369,11 +538,13 @@ func (s *Server) handleNotification(ctx context.Context, n Notification, norm st
 	if !s.cfg.EscalationEnabled() {
 		s.logger.Log("unclassified_no_escalation", n, norm)
 		s.updateLog(ctx, logID, LogUpdate{Status: LogUnclassifiedNoEscalation})
+		_ = s.events.Update(ctx, eventID, "unclassified", nil, "")
 		return
 	}
-	id := s.pending.Add(PendingEntry{Notification: n, Normalized: norm, Kind: pendingClassify, LogID: logID})
+	id := s.pending.Add(PendingEntry{Notification: n, Event: event, EventID: eventID, Normalized: norm, Kind: pendingClassify, LogID: logID})
 	s.logger.Log("escalated_classify", n, map[string]string{"id": id, "normalized": norm})
 	s.updateLog(ctx, logID, LogUpdate{Status: LogEscalatedClassify, TelegramPendingID: id})
+	_ = s.events.Update(ctx, eventID, "awaiting_classification", nil, "")
 	if err := s.tg.SendClassify(ctx, id, n); err != nil {
 		s.logger.Log("telegram_send_error", n, err.Error())
 		s.updateLog(ctx, logID, LogUpdate{Status: LogTelegramError, Error: err.Error()})
@@ -382,73 +553,92 @@ func (s *Server) handleNotification(ctx context.Context, n Notification, norm st
 
 // attemptMatch runs the matcher and, on a confident single hit, advances the row and
 // triggers release.
-func (s *Server) attemptMatch(ctx context.Context, n Notification, logID int64) {
-	candidates, err := s.store.ListPendingFiat(ctx)
+func (s *Server) attemptMatch(ctx context.Context, n Notification, logID int64, event PaymentEvent, eventID int64) {
+	candidate, ambiguous, candidates, err := s.events.Match(ctx, event, time.Now())
 	if err != nil {
 		s.logger.Log("list_pending_error", n, err.Error())
 		s.updateLog(ctx, logID, LogUpdate{Status: LogListError, Error: err.Error()})
 		return
 	}
 
-	candidate, ambiguous := s.matcher.Match(n, candidates)
 	switch {
 	case candidate != nil:
-		s.advanceAndRelease(ctx, n, *candidate, logID)
+		s.confirmAndRelease(ctx, n, event, eventID, *candidate, logID)
 	case len(ambiguous) > 0:
-		s.escalatePick(ctx, n, ambiguous, logID)
+		s.escalatePick(ctx, n, event, eventID, ambiguous, logID)
 	default:
 		s.logger.Log("unmatched", n, nil)
 		s.updateLog(ctx, logID, LogUpdate{Status: LogUnmatched})
+		status, reason := eventEligibilityStatus(event, candidates)
+		_ = s.events.Update(ctx, eventID, status, nil, reason)
 	}
 }
 
-// advanceAndRelease marks the row as fiat-arrived and calls the dexMmController release
-// webhook. Idempotent: a row already advanced by a concurrent path logs and exits.
-func (s *Server) advanceAndRelease(ctx context.Context, n Notification, c Candidate, logID int64) {
-	txID := c.ID
-	evidence := buildEvidence(n, c)
-	advanced, err := s.store.MarkFiatArrived(ctx, txID, evidence)
-	if err != nil {
-		s.logger.Log("mark_arrived_error", n, map[string]any{"tx_id": txID, "error": err.Error()})
-		s.updateLog(ctx, logID, LogUpdate{Status: LogMarkError, MatchedTxID: &txID, Error: err.Error()})
-		return
-	}
-	if !advanced {
-		s.logger.Log("already_arrived", n, map[string]uint{"tx_id": txID})
-		// Still attempt release: it is idempotent on dexMmController and may have been
-		// missed on the prior advance.
-	}
+func eventEligibilityStatus(event PaymentEvent, candidates []paymentevents.Candidate) (string, string) {
+	return paymentevents.EligibilityStatus(event, candidates, time.Now())
+}
 
-	if err := s.release.Release(ctx, txID); err != nil {
-		s.logger.Log("release_error", n, map[string]any{"tx_id": txID, "advanced": advanced, "error": err.Error()})
-		status := LogReleaseError
-		if !advanced {
-			status = LogAlreadyReleased
+// confirmAndRelease presents the outcome of the neutral channel-and-release
+// coordinator in PushPush's existing logs.
+func (s *Server) confirmAndRelease(ctx context.Context, n Notification, event PaymentEvent, eventID int64, c paymentevents.Candidate, logID int64) {
+	txID := c.ID
+	result, err := s.events.Complete(ctx, event, eventID, c)
+	if err != nil {
+		status := LogMarkError
+		action := "confirmation_error"
+		if result.Advanced {
+			status = LogReleaseError
+			action = "release_error"
 		}
+		s.logger.Log(action, n, map[string]any{"tx_id": txID, "error": err.Error()})
 		s.updateLog(ctx, logID, LogUpdate{Status: status, MatchedTxID: &txID, Error: err.Error()})
 		return
 	}
-
-	if advanced {
-		s.logger.Log("released", n, map[string]any{"tx_id": txID, "advanced": advanced})
-		s.updateLog(ctx, logID, LogUpdate{Status: LogReleased, MatchedTxID: &txID})
-	} else {
-		s.logger.Log("released", n, map[string]any{"tx_id": txID, "advanced": advanced})
-		s.updateLog(ctx, logID, LogUpdate{Status: LogAlreadyReleased, MatchedTxID: &txID})
+	if result.State == paymentevents.CompletionWaiting {
+		s.logger.Log("awaiting_channels", n, map[string]any{"tx_id": txID, "required": result.Required, "present": result.Present})
+		s.updateLog(ctx, logID, LogUpdate{Status: LogPicked, MatchedTxID: &txID})
+		return
 	}
+	if result.State == paymentevents.CompletionDuplicate {
+		return
+	}
+	s.logger.Log("released", n, map[string]any{"tx_id": txID})
+	s.updateLog(ctx, logID, LogUpdate{Status: LogReleased, MatchedTxID: &txID})
 	log.Printf("pushpush: released tx %d (%.2f %s) via %s", txID, c.FiatAmount, c.FiatCurrency, n.App)
 }
 
+// ConfirmEmail is the presentation callback used by paymentemail after the
+// neutral processor has produced a single candidate.
+func (s *Server) ConfirmEmail(ctx context.Context, event paymentevents.PaymentEvent, eventID int64, candidate paymentevents.Candidate, subject string) {
+	notification := Notification{
+		App: event.Provider, Title: subject, Text: event.Description,
+		Time: event.ProviderTimestamp.Format(time.RFC3339),
+	}
+	s.confirmAndRelease(ctx, notification, event, eventID, candidate, 0)
+}
+
+// AmbiguousEmail delegates a neutral ambiguous result to the existing Telegram
+// selection UI; selection still records only the email channel.
+func (s *Server) AmbiguousEmail(ctx context.Context, event paymentevents.PaymentEvent, eventID int64, candidates []paymentevents.Candidate, subject string) {
+	notification := Notification{
+		App: event.Provider, Title: subject, Text: event.Description,
+		Time: event.ProviderTimestamp.Format(time.RFC3339),
+	}
+	s.escalatePick(ctx, notification, event, eventID, candidates, 0)
+}
+
 // escalatePick asks a human to choose among ambiguous amount+currency matches.
-func (s *Server) escalatePick(ctx context.Context, n Notification, candidates []Candidate, logID int64) {
+func (s *Server) escalatePick(ctx context.Context, n Notification, event PaymentEvent, eventID int64, candidates []paymentevents.Candidate, logID int64) {
 	if !s.cfg.EscalationEnabled() {
 		s.logger.Log("ambiguous_no_escalation", n, map[string]int{"candidates": len(candidates)})
 		s.updateLog(ctx, logID, LogUpdate{Status: LogAmbiguousNoEscalation})
+		_ = s.events.Update(ctx, eventID, "ambiguous", nil, "")
 		return
 	}
-	id := s.pending.Add(PendingEntry{Notification: n, Candidates: candidates, Kind: pendingPick, LogID: logID})
+	id := s.pending.Add(PendingEntry{Notification: n, Event: event, EventID: eventID, Candidates: candidates, Kind: pendingPick, LogID: logID})
 	s.logger.Log("escalated_pick", n, map[string]any{"id": id, "candidates": candidateIDs(candidates)})
 	s.updateLog(ctx, logID, LogUpdate{Status: LogEscalatedPick, TelegramPendingID: id})
+	_ = s.events.Update(ctx, eventID, "awaiting_selection", nil, "")
 	if err := s.tg.SendPick(ctx, id, n, candidates); err != nil {
 		s.logger.Log("telegram_send_error", n, err.Error())
 		s.updateLog(ctx, logID, LogUpdate{Status: LogTelegramError, Error: err.Error()})
@@ -502,12 +692,13 @@ func (s *Server) handleClassifyDecision(ctx context.Context, callbackID, decisio
 		s.logger.Log("user_allowed", entry.Notification, entry.Normalized)
 		s.updateLog(ctx, entry.LogID, LogUpdate{Status: LogUserAllowed, RuleDecision: "allow"})
 		s.tg.AnswerCallback(ctx, callbackID, "Whitelisted.")
-		s.attemptMatch(ctx, entry.Notification, entry.LogID)
+		s.attemptMatch(ctx, entry.Notification, entry.LogID, entry.Event, entry.EventID)
 		return
 	}
 	s.rules.Add(entry.Notification.App, entry.Normalized, false)
 	s.logger.Log("user_denied", entry.Notification, entry.Normalized)
 	s.updateLog(ctx, entry.LogID, LogUpdate{Status: LogUserDenied, RuleDecision: "deny"})
+	_ = s.events.Update(ctx, entry.EventID, "denied", nil, "")
 	s.tg.AnswerCallback(ctx, callbackID, "Blacklisted.")
 }
 
@@ -518,7 +709,7 @@ func (s *Server) handlePickDecision(ctx context.Context, callbackID, id, txIDStr
 		s.tg.AnswerCallback(ctx, callbackID, "Already handled or expired.")
 		return
 	}
-	var picked *Candidate
+	var picked *paymentevents.Candidate
 	for i := range entry.Candidates {
 		if fmt.Sprintf("%d", entry.Candidates[i].ID) == txIDStr {
 			picked = &entry.Candidates[i]
@@ -531,8 +722,8 @@ func (s *Server) handlePickDecision(ctx context.Context, callbackID, id, txIDStr
 	}
 	txID := picked.ID
 	s.updateLog(ctx, entry.LogID, LogUpdate{Status: LogPicked, MatchedTxID: &txID})
-	s.advanceAndRelease(ctx, entry.Notification, *picked, entry.LogID)
-	s.tg.AnswerCallback(ctx, callbackID, fmt.Sprintf("Released tx %d.", picked.ID))
+	s.confirmAndRelease(ctx, entry.Notification, entry.Event, entry.EventID, *picked, entry.LogID)
+	s.tg.AnswerCallback(ctx, callbackID, fmt.Sprintf("Confirmed tx %d; release remains channel-gated.", picked.ID))
 }
 
 // buildEvidence is the jsonb stored in transactions.dex_fiat_arrival as proof of arrival.
@@ -549,10 +740,10 @@ func buildEvidence(n Notification, c Candidate) json.RawMessage {
 		"normalized":  normalize(n.Title + " " + n.Text),
 		"received_at": time.Now().UTC().Format(time.RFC3339),
 		"matched_tx": map[string]any{
-			"id":           c.ID,
-			"fiat_amount":  c.FiatAmount,
+			"id":            c.ID,
+			"fiat_amount":   c.FiatAmount,
 			"fiat_currency": c.FiatCurrency,
-			"dex":          c.Dex,
+			"dex":           c.Dex,
 		},
 	}
 	b, err := json.Marshal(doc)
@@ -562,7 +753,7 @@ func buildEvidence(n Notification, c Candidate) json.RawMessage {
 	return b
 }
 
-func candidateIDs(cs []Candidate) []uint {
+func candidateIDs(cs []paymentevents.Candidate) []uint {
 	ids := make([]uint, 0, len(cs))
 	for _, c := range cs {
 		ids = append(ids, c.ID)

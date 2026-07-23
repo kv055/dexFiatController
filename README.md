@@ -55,6 +55,9 @@ dexFiatController/
 +-- internal/controller/            # Connector orchestration and polling loop
 +-- internal/models/                # Transaction, payment, balance, config models
 +-- internal/notifications/         # Client for dexUnifiedApi payment notifications
++-- internal/paymentemail/          # IMAP reader, MIME safety, and exact email templates
++-- internal/paymentevents/         # Source-neutral matching, channel gate, and release
++-- internal/pushpush/              # Push HTTP adapter and Telegram presentation
 +-- internal/secrets/               # Shared Postgres secret/account store
 +-- services/totp-api/              # TOTP microservice
 +-- Dockerfile
@@ -121,6 +124,100 @@ http://unified-api:5010/internal/payment_notifications
 
 Set `PAYMENT_NOTIFICATIONS_SHARED_SECRET` when the unified API is configured to require `X-Webhook-Secret`.
 
+## Payment Event Ingestion
+
+Push notifications and authenticated Wise/PayPal email are normalized into
+`fiat_payment_events`. Matching is scoped to the provider account linked by the
+transaction's canonical `payment_method`; amount/currency are mandatory and sender plus
+reference are disambiguation evidence. Raw MIME stays in Maddy and Postgres stores only
+the parsed fields and SHA-256.
+
+Each selected account channel is mandatory. An account configured with `push,email`
+advances only after both channels confirm the same transaction; `push` or `email` alone
+requires only that channel. Confirmation and `DexFiatHasArrived` advancement are atomic,
+and the release webhook is called only by the winning transition.
+
+The payment-email reader uses TLS IMAP IDLE plus periodic UID reconciliation and bounded
+reconnect backoff. Rollout modes are:
+
+- `capture`: record message metadata and hashes only.
+- `shadow`: authenticate and exact-template parse, then record prospective matches
+  without confirmations, transaction changes, or release.
+- `active`: process only messages newer than both `PAYMENT_EMAIL_ACTIVATION_UID` and
+  `PAYMENT_EMAIL_ACTIVATION_TIME`.
+
+Active mode refuses to start without both watermarks. Wise/PayPal release parsing uses
+versioned embedded templates and requires a passing DKIM result from the template's
+approved signing domain. A new layout or forwarding path that breaks DKIM remains
+rejected; it is never routed through a generic or AI parser.
+
+`GET /notification-health?payment_method=Wise` reports the linked account's selected
+channels and each channel's last-success health. It uses the heartbeat shared secret and
+fails when the method is not active and linked.
+
+## MacroDroid Phone Heartbeat
+
+The phone that forwards bank-payment notifications must periodically check in with
+PushPush. This makes a stopped MacroDroid instance, a dead phone, or a lost network
+connection visible before a fiat payment is missed.
+
+PushPush provides two protected endpoints:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/phone-heartbeat` | Record that the phone is online. |
+| `GET` | `/phone-heartbeat` | Read the latest check-in and whether it is still online. |
+
+Both endpoints require the `X-Webhook-Secret` header when a heartbeat secret is
+configured. Set `PUSHPUSH_HEARTBEAT_SECRET` to a dedicated random value. If it is
+unset, PushPush uses `PUSHPUSH_NOTIFY_SECRET`, so existing MacroDroid notification
+authentication can be reused. `PUSHPUSH_HEARTBEAT_MAX_AGE` controls when the phone is
+considered offline; it defaults to `15m`.
+
+Add these settings to the Fiat Controller environment before deploying it:
+
+```dotenv
+PUSHPUSH_HEARTBEAT_SECRET=<a-long-random-secret>
+PUSHPUSH_HEARTBEAT_MAX_AGE=15m
+```
+
+### MacroDroid setup
+
+1. Create a new macro named **PushPush heartbeat**.
+2. Add the **Timer** trigger. Use a five-minute interval; this leaves room for Android
+   battery/network delays while remaining well below the default 15-minute maximum age.
+3. Add an **HTTP Request** action with these values:
+
+   | Setting | Value |
+   | --- | --- |
+   | Method | `POST` |
+   | URL | `https://<your-public-fiat-controller-host>/phone-heartbeat` |
+   | Content type | `application/json` |
+   | Request body | `{"device_id":"<stable-phone-name>"}` |
+   | Header | `X-Webhook-Secret: <PUSHPUSH_HEARTBEAT_SECRET>` |
+
+   Use the same externally reachable HTTPS host that MacroDroid uses for its existing
+   `/notify` requests. The `device_id` is a label for operators, not a secret; use a
+   stable value such as `revolut-payment-phone`.
+4. In MacroDroid, exclude the app from battery optimization and permit background data.
+   Otherwise Android may delay the timer and produce false offline reports.
+5. Run the macro once manually. A successful response is HTTP `200` and contains
+   `"online":true` plus the server timestamp.
+
+Check the current status from an authenticated machine:
+
+```bash
+curl -H 'X-Webhook-Secret: <PUSHPUSH_HEARTBEAT_SECRET>' \
+  https://<your-public-fiat-controller-host>/phone-heartbeat
+```
+
+The response contains `online`, `last_seen`, and `max_age_seconds`. `online` becomes
+`false` when no heartbeat has ever arrived or the latest one is older than the maximum
+age. Every accepted ping is retained in the shared Postgres
+`fiat_phone_heartbeats` audit table; the latest heartbeat is also retained in
+`/data/phone-heartbeat.json`, so restarting the Fiat Controller does not clear an
+offline condition.
+
 ## TOTP API
 
 The TOTP helper service lives in `services/totp-api`.
@@ -162,6 +259,14 @@ Important variables:
 | `EMAIL_IMAP_HOST` | unset | IMAP host |
 | `EMAIL_IMAP_USER` | unset | IMAP username |
 | `EMAIL_IMAP_PASS` | unset | IMAP password |
+| `PAYMENT_EMAIL_MODE` | `capture` | Payment mail rollout mode: capture, shadow, or active |
+| `PAYMENT_EMAIL_IMAP_HOST` | unset | Maddy's internal IMAP host |
+| `PAYMENT_EMAIL_IMAP_USER` | unset | Dedicated payment mailbox |
+| `PAYMENT_EMAIL_IMAP_PASS` | unset | Dedicated payment mailbox secret |
+| `PAYMENT_EMAIL_TLS_SERVER_NAME` | unset | Certificate name expected on IMAP TLS |
+| `PAYMENT_EMAIL_TLS_CA_FILE` | unset | Optional private CA/fullchain trust file |
+| `PAYMENT_EMAIL_ACTIVATION_UID` | `0` | First safe active-run UID watermark |
+| `PAYMENT_EMAIL_ACTIVATION_TIME` | unset | RFC3339 active-run time watermark |
 | `POLL_INTERVAL` | `30s` | Transaction polling interval |
 | `PAYMENT_NOTIFICATIONS_API_URL` | unset | Unified API notification receiver |
 | `PAYMENT_NOTIFICATIONS_SHARED_SECRET` | unset | Optional webhook secret |

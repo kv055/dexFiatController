@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
+	"dexFiatController/internal/paymentevents"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -14,9 +16,9 @@ import (
 // dexFiatController module cannot import dexMmController, so the status string is
 // duplicated here. Keep in sync with dexMmController/internal/db/models.go.
 const (
-	statusDexPositionTaken   = "DexPositionTaken"
-	statusDexFiatHasArrived  = "DexFiatHasArrived"
-	directionBUY             = "BUY"
+	statusDexPositionTaken  = "DexPositionTaken"
+	statusDexFiatHasArrived = "DexFiatHasArrived"
+	directionBUY            = "BUY"
 )
 
 // Candidate is a pending bid transaction awaiting fiat arrival.
@@ -25,6 +27,11 @@ type Candidate struct {
 	FiatAmount              float64         `json:"fiat_amount"`
 	FiatCurrency            string          `json:"fiat_currency"`
 	Dex                     string          `json:"dex"`
+	PaymentMethod           string          `json:"payment_method"`
+	AccountID               int64           `json:"account_id"`
+	AccountProvider         string          `json:"account_provider"`
+	NotificationChannels    []string        `json:"notification_channels"`
+	PendingSince            time.Time       `json:"pending_since"`
 	CounterpartyPaymentInfo json.RawMessage `json:"counterparty_payment_info"`
 }
 
@@ -79,9 +86,16 @@ func (s *TxStore) DB() *sql.DB {
 // notification can match against.
 func (s *TxStore) ListPendingFiat(ctx context.Context) ([]Candidate, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, fiat_amount, fiat_currency, COALESCE(dex, ''), counterparty_payment_info
-		FROM transactions
-		WHERE status = $1 AND direction = $2 AND deleted_at IS NULL
+		SELECT t.id, t.fiat_amount, t.fiat_currency, COALESCE(t.dex, ''),
+		       t.counterparty_payment_info, COALESCE(t.payment_method, ''),
+		       COALESCE(a.id, 0), COALESCE(a.provider, ''),
+		       COALESCE(array_to_string(a.notification_channels::text[], ','), ''),
+		       COALESCE(NULLIF(t.dex_offer_taken, '0001-01-01'::timestamptz), t.created_at)
+		FROM transactions t
+		LEFT JOIN payment_methods pm ON lower(pm.name)=lower(t.payment_method)
+		LEFT JOIN bank_accounts ba ON ba.id=pm.bank_account_id
+		LEFT JOIN accounts a ON a.id=COALESCE(pm.account_id, ba.account_id)
+		WHERE t.status = $1 AND t.direction = $2 AND t.deleted_at IS NULL
 	`, statusDexPositionTaken, directionBUY)
 	if err != nil {
 		return nil, fmt.Errorf("pushpush: list pending fiat: %w", err)
@@ -92,9 +106,15 @@ func (s *TxStore) ListPendingFiat(ctx context.Context) ([]Candidate, error) {
 	for rows.Next() {
 		var c Candidate
 		var raw sql.NullString
-		if err := rows.Scan(&c.ID, &c.FiatAmount, &c.FiatCurrency, &c.Dex, &raw); err != nil {
+		var channels string
+		if err := rows.Scan(
+			&c.ID, &c.FiatAmount, &c.FiatCurrency, &c.Dex, &raw,
+			&c.PaymentMethod, &c.AccountID, &c.AccountProvider, &channels,
+			&c.PendingSince,
+		); err != nil {
 			return nil, fmt.Errorf("pushpush: scan pending fiat: %w", err)
 		}
+		c.NotificationChannels = paymentevents.SplitChannels(channels)
 		if raw.Valid && raw.String != "" {
 			c.CounterpartyPaymentInfo = json.RawMessage(raw.String)
 		}

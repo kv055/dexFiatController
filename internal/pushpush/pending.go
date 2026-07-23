@@ -4,6 +4,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"dexFiatController/internal/paymentevents"
 )
 
 // pendingKind distinguishes the two escalation flows.
@@ -17,8 +19,10 @@ const (
 // PendingEntry is a notification awaiting a Telegram decision.
 type PendingEntry struct {
 	Notification Notification
+	Event        PaymentEvent
+	EventID      int64
 	Normalized   string
-	Candidates   []Candidate
+	Candidates   []paymentevents.Candidate
 	Kind         pendingKind
 	LogID        int64 // fiat_tx_push_logs row this escalation belongs to (0 if none)
 }

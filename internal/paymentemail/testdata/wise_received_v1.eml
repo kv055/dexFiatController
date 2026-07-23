@@ -1,0 +1,12 @@
+From: Wise <notifications@wise.com>
+To: payments@example.test
+Subject: You received money
+Message-ID: <sanitized-wise-v1@example.test>
+Date: Thu, 23 Jul 2026 10:15:00 +0000
+Authentication-Results: mx.example.test; dkim=pass header.d=wise.com; spf=pass; dmarc=pass
+Content-Type: text/plain; charset=utf-8
+
+You received
+Amount: 123.45 EUR
+From: Jane Example
+Reference: sanitized-order-42
