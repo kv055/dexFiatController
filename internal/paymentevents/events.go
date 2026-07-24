@@ -232,8 +232,8 @@ func (s *EventStore) Confirm(ctx context.Context, event PaymentEvent, eventID in
 		FROM transactions t
 		JOIN payment_methods pm ON lower(pm.name)=lower(t.payment_method)
 		LEFT JOIN bank_accounts ba ON ba.id=pm.bank_account_id
-		JOIN accounts a ON a.id=COALESCE(pm.account_id, ba.account_id)
-		WHERE t.id=$1 AND t.deleted_at IS NULL
+		JOIN accounts a ON a.id=COALESCE(pm.account_id, ba.account_id) AND a.is_active
+		WHERE t.id=$1 AND t.deleted_at IS NULL AND pm.is_active
 	`, txID).Scan(&accountID, &provider, &channels, &status)
 	if err != nil {
 		return ConfirmationResult{}, fmt.Errorf("payment events: resolve transaction payment account: %w", err)

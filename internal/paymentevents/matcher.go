@@ -44,8 +44,8 @@ func (s *EventStore) ListPending(ctx context.Context) ([]Candidate, error) {
 		FROM transactions t
 		LEFT JOIN payment_methods pm ON lower(pm.name)=lower(t.payment_method)
 		LEFT JOIN bank_accounts ba ON ba.id=pm.bank_account_id
-		LEFT JOIN accounts a ON a.id=COALESCE(pm.account_id, ba.account_id)
-		WHERE t.status=$1 AND t.direction=$2 AND t.deleted_at IS NULL
+		LEFT JOIN accounts a ON a.id=COALESCE(pm.account_id, ba.account_id) AND a.is_active
+		WHERE t.status=$1 AND t.direction=$2 AND t.deleted_at IS NULL AND pm.is_active
 	`, statusDexPositionTaken, directionBUY)
 	if err != nil {
 		return nil, fmt.Errorf("payment events: list pending fiat: %w", err)
