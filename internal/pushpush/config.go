@@ -14,8 +14,9 @@ import (
 type Config struct {
 	Addr string
 
-	// NotifySecret gates POST /notify via the X-Webhook-Secret header. Empty disables
-	// the check (not recommended in production).
+	// NotifySecret gates POST /notify via the X-Webhook-Secret header. In normal
+	// operation an empty value rejects every request; only explicit capture-only
+	// discovery mode accepts unauthenticated payloads.
 	NotifySecret string
 
 	// HeartbeatSecret authorizes phone heartbeat requests. When empty,

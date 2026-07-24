@@ -163,33 +163,44 @@ rejected; it is never routed through a generic or AI parser.
 channels and each channel's last-success health. It uses the heartbeat shared secret and
 fails when the method is not active and linked.
 
-## MacroDroid Phone Heartbeat
+## Phone Push Callbacks and Heartbeat
 
 The phone that forwards bank-payment notifications must periodically check in with
 PushPush. This makes a stopped MacroDroid instance, a dead phone, or a lost network
 connection visible before a fiat payment is missed.
 
-PushPush provides two protected endpoints:
+The Fiat Controller stays private on the Docker network. nginx exposes only these exact
+public callbacks on the dashboard hostname:
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/phone-heartbeat` | Record that the phone is online. |
-| `GET` | `/phone-heartbeat` | Read the latest check-in and whether it is still online. |
+| `POST` | `/pushpush/notify` | Ingest a selected banking-app notification. |
+| `POST` | `/pushpush/phone-heartbeat` | Record that the phone is online. |
 
-Both endpoints require the `X-Webhook-Secret` header when a heartbeat secret is
-configured. Set `PUSHPUSH_HEARTBEAT_SECRET` to a dedicated random value. If it is
-unset, PushPush uses `PUSHPUSH_NOTIFY_SECRET`, so existing MacroDroid notification
-authentication can be reused. `PUSHPUSH_HEARTBEAT_MAX_AGE` controls when the phone is
-considered offline; it defaults to `15m`.
+Both require `X-Webhook-Secret`. Normal PushPush operation fails closed if
+`PUSHPUSH_NOTIFY_SECRET` is unset. Set `PUSHPUSH_HEARTBEAT_SECRET` to a dedicated
+random value, or leave it unset to reuse `PUSHPUSH_NOTIFY_SECRET`.
+`PUSHPUSH_HEARTBEAT_MAX_AGE` controls when the phone is considered offline; it defaults
+to `15m`. The only exception is explicit local capture-only discovery mode, which is
+not a production callback configuration.
 
 Add these settings to the Fiat Controller environment before deploying it:
 
 ```dotenv
-PUSHPUSH_HEARTBEAT_SECRET=<a-long-random-secret>
+PUSHPUSH_NOTIFY_SECRET=<a-long-random-secret>
+PUSHPUSH_HEARTBEAT_SECRET=<optional-dedicated-secret>
 PUSHPUSH_HEARTBEAT_MAX_AGE=15m
 ```
 
-### MacroDroid setup
+### Dashboard-guided Android setup
+
+Open **Trading accounts → Communication → Phone payment monitoring** after logging in.
+It shows the callback URLs, live heartbeat state, and deliberate reveal/copy controls
+for deployment-managed credentials. Its MacroDroid and Tasker guides include non-secret
+QR codes for each HTTP configuration. Select the banking apps on the phone; grant
+notification access and remove the automation app from battery optimisation.
+
+### MacroDroid heartbeat details
 
 1. Create a new macro named **PushPush heartbeat**.
 2. Add the **Timer** trigger. Use a five-minute interval; this leaves room for Android
@@ -199,13 +210,13 @@ PUSHPUSH_HEARTBEAT_MAX_AGE=15m
    | Setting | Value |
    | --- | --- |
    | Method | `POST` |
-   | URL | `https://<your-public-fiat-controller-host>/phone-heartbeat` |
+   | URL | `https://<dashboard-host>/pushpush/phone-heartbeat` |
    | Content type | `application/json` |
    | Request body | `{"device_id":"<stable-phone-name>"}` |
    | Header | `X-Webhook-Secret: <PUSHPUSH_HEARTBEAT_SECRET>` |
 
-   Use the same externally reachable HTTPS host that MacroDroid uses for its existing
-   `/notify` requests. The `device_id` is a label for operators, not a secret; use a
+   The notification forwarder uses `POST https://<dashboard-host>/pushpush/notify` with
+   JSON containing `app`, `title`, `text`, and optional `time`. The `device_id` is a label for operators, not a secret; use a
    stable value such as `revolut-payment-phone`.
 4. In MacroDroid, exclude the app from battery optimization and permit background data.
    Otherwise Android may delay the timer and produce false offline reports.
@@ -216,7 +227,7 @@ Check the current status from an authenticated machine:
 
 ```bash
 curl -H 'X-Webhook-Secret: <PUSHPUSH_HEARTBEAT_SECRET>' \
-  https://<your-public-fiat-controller-host>/phone-heartbeat
+  http://fiat-controller:8080/phone-heartbeat
 ```
 
 The response contains `online`, `last_seen`, and `max_age_seconds`. `online` becomes

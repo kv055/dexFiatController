@@ -78,3 +78,18 @@ func TestPhoneHeartbeatRejectsWrongSecretAndReportsStale(t *testing.T) {
 		t.Fatalf("status response = %d, body = %s", statusRes.Code, statusRes.Body.String())
 	}
 }
+
+func TestPublicCallbacksFailClosedWithoutCredentials(t *testing.T) {
+	s := &Server{cfg: Config{}}
+	request := httptest.NewRequest(http.MethodPost, "/notify", nil)
+	if s.authorizeNotify(request) {
+		t.Fatal("normal-mode notify authorization accepted an empty configured secret")
+	}
+	if s.authorizeHeartbeat(request) {
+		t.Fatal("normal-mode heartbeat authorization accepted an empty configured secret")
+	}
+	capture := &Server{captureOnly: true}
+	if !capture.authorizeNotify(request) || !capture.authorizeHeartbeat(request) {
+		t.Fatal("explicit capture-only discovery mode must remain separate and permissive")
+	}
+}
