@@ -142,8 +142,27 @@ coordinator and cannot bypass channel confirmation.
 
 Each selected account channel is mandatory. An account configured with `push,email`
 advances only after both channels confirm the same transaction; `push` or `email` alone
-requires only that channel. Confirmation and `DexFiatHasArrived` advancement are atomic,
-and the release webhook is called only by the winning transition.
+requires Telegram ownership confirmation before that channel is accepted.
+
+When both channels are selected, the controller compares provider/account, exact
+minor-unit amount, currency, normalized sender and reference values, and provider
+timestamps (with five minutes of tolerance). Sender and reference are compared only
+when both notifications provide them. A matching pair advances automatically; a
+populated-field mismatch opens a Telegram prompt showing the transaction and both
+notifications. The operator answers with `✅ Yes` or `❌ No`. A rejection discards
+only the questioned signal, leaving any earlier valid channel confirmation in place.
+When an ambiguous notification first requires the operator to select a transaction,
+the selected transaction is shown in the same ownership prompt and still requires the
+separate Yes/No answer.
+
+Telegram ownership prompts are stored in
+`fiat_payment_confirmation_requests`, so their buttons remain actionable across Fiat
+Controller restarts while the transaction is still in `DexPositionTaken`. Answered
+messages have their buttons removed and are updated with the decision. Missing Telegram
+configuration, delivery failures, stale callbacks, and callbacks from another chat all
+fail closed and leave the transaction pending. Confirmation and
+`DexFiatHasArrived` advancement are atomic, and the release webhook is called only by
+the winning transition.
 
 The payment-email reader uses TLS IMAP IDLE plus periodic UID reconciliation and bounded
 reconnect backoff. Rollout modes are:

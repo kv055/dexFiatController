@@ -179,6 +179,11 @@ func (s *Server) Run(ctx context.Context) error {
 		// Hot-reload the shared Telegram bot config from the DB row.
 		go runTelegramSettingsPoller(ctx, s.store.DB(), s.tg, s.cfg.HTTPClient, s.telegramVersion)
 		go s.emailReader.Run(ctx)
+		go func() {
+			if err := s.ingestion.RetryPendingConfirmations(ctx); err != nil {
+				log.Printf("pushpush: retry pending payment confirmations: %v", err)
+			}
+		}()
 	}
 
 	var handler http.Handler = mux
@@ -537,9 +542,13 @@ func (s *Server) Report(ctx context.Context, signal paymentevents.InboundSignal,
 		update.Status = LogEscalatedClassify
 	case paymentingestion.OutcomeAwaitingSelection:
 		update.Status = LogEscalatedPick
+	case paymentingestion.OutcomeAwaitingConfirmation:
+		update.Status = LogEscalatedPick
 	case paymentingestion.OutcomeNoClassification:
 		update.Status = LogUnclassifiedNoEscalation
 	case paymentingestion.OutcomeNoSelection:
+		update.Status = LogAmbiguousNoEscalation
+	case paymentingestion.OutcomeNoConfirmation:
 		update.Status = LogAmbiguousNoEscalation
 	case paymentingestion.OutcomeListError:
 		update.Status = LogListError
@@ -549,7 +558,9 @@ func (s *Server) Report(ctx context.Context, signal paymentevents.InboundSignal,
 		update.Status, update.RuleDecision = LogUserAllowed, "allow"
 	case paymentingestion.OutcomeUserDenied:
 		update.Status, update.RuleDecision = LogUserDenied, "deny"
-	case paymentingestion.OutcomePicked, paymentingestion.OutcomeWaitingChannels:
+	case paymentingestion.OutcomePaymentRejected:
+		update.Status = LogUserDenied
+	case paymentingestion.OutcomePicked, paymentingestion.OutcomePaymentApproved, paymentingestion.OutcomeWaitingChannels:
 		update.Status = LogPicked
 	case paymentingestion.OutcomeConfirmationError:
 		update.Status = LogMarkError
@@ -604,10 +615,62 @@ func (s *Server) handleTelegramWebhook(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		s.handlePickDecision(ctx, u.CallbackQuery.ID, parts[1], parts[2])
+	case "pay":
+		if len(parts) != 3 {
+			s.tg.AnswerCallback(ctx, u.CallbackQuery.ID, "Malformed payment callback.")
+			break
+		}
+		chatID := ""
+		if u.CallbackQuery.Message != nil && u.CallbackQuery.Message.Chat != nil {
+			chatID = strconv.FormatInt(u.CallbackQuery.Message.Chat.ID, 10)
+		}
+		s.handlePaymentConfirmationDecision(ctx, u.CallbackQuery.ID, chatID, parts[1], parts[2])
 	default:
 		s.tg.AnswerCallback(ctx, u.CallbackQuery.ID, "Unknown callback.")
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handlePaymentConfirmationDecision(ctx context.Context, callbackID, chatID, decision, requestID string) {
+	if decision != "yes" && decision != "no" {
+		s.tg.AnswerCallback(ctx, callbackID, "Unknown payment decision.")
+		return
+	}
+	id, err := strconv.ParseInt(requestID, 36, 64)
+	if err != nil || id <= 0 {
+		s.tg.AnswerCallback(ctx, callbackID, "Malformed payment callback.")
+		return
+	}
+	result, request, err := s.ingestion.DecidePaymentConfirmation(ctx, id, chatID, decision == "yes")
+	if err != nil {
+		if result.Advanced && request.ID != 0 {
+			_ = s.tg.EditPaymentConfirmation(ctx, request, "⚠️ Confirmed, but release failed; operator action is required.")
+			s.tg.AnswerCallback(ctx, callbackID, "Confirmed, but release failed.")
+			return
+		}
+		if request.DecisionStatus == "expired" {
+			_ = s.tg.EditPaymentConfirmation(ctx, request, "⌛ Expired — the transaction is no longer pending.")
+			s.tg.AnswerCallback(ctx, callbackID, "This confirmation expired.")
+			return
+		}
+		s.tg.AnswerCallback(ctx, callbackID, "Already handled, expired, or invalid chat.")
+		return
+	}
+	if decision == "no" {
+		if err := s.tg.EditPaymentConfirmation(ctx, request, "❌ Rejected — the transaction remains pending."); err != nil {
+			log.Printf("pushpush: edit rejected payment confirmation: %v", err)
+		}
+		s.tg.AnswerCallback(ctx, callbackID, "Payment rejected.")
+		return
+	}
+	suffix := fmt.Sprintf("✅ Confirmed — transaction #%d was released.", request.TransactionID)
+	if result.State == paymentevents.CompletionWaiting {
+		suffix = "✅ Confirmed — waiting for the other notification channel."
+	}
+	if err := s.tg.EditPaymentConfirmation(ctx, request, suffix); err != nil {
+		log.Printf("pushpush: edit approved payment confirmation: %v", err)
+	}
+	s.tg.AnswerCallback(ctx, callbackID, "Payment confirmed.")
 }
 
 // handleClassifyDecision processes a yes/no answer to "is this a payment?".

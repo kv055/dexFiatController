@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -82,6 +83,39 @@ func (t *TelegramClient) SendPick(ctx context.Context, id string, presentation p
 		kb.Row(telegram.Button(label, fmt.Sprintf("pick:%s:%d", id, c.ID)))
 	}
 	return inner.SendMessage(ctx, text, &kb)
+}
+
+// SendPaymentConfirmation asks whether a matched notification belongs to the
+// displayed transaction. Its compact base-36 request id keeps callback data
+// below Telegram's 64-byte limit.
+func (t *TelegramClient) SendPaymentConfirmation(ctx context.Context, request paymentevents.PaymentConfirmationRequest) (string, int64, error) {
+	inner := t.client()
+	if inner == nil {
+		return "", 0, fmt.Errorf("telegram client not configured")
+	}
+	id := strconv.FormatInt(request.ID, 36)
+	kb := telegram.InlineKeyboard{}
+	kb.Row(
+		telegram.Button("✅ Yes", "pay:yes:"+id),
+		telegram.Button("❌ No", "pay:no:"+id),
+	)
+	sent, err := inner.SendInteractiveMessage(ctx, request.MessageText, &kb)
+	if err != nil {
+		return "", 0, err
+	}
+	return sent.ChatID, sent.MessageID, nil
+}
+
+// EditPaymentConfirmation removes the buttons and appends the persisted result.
+func (t *TelegramClient) EditPaymentConfirmation(ctx context.Context, request paymentevents.PaymentConfirmationRequest, suffix string) error {
+	inner := t.client()
+	if inner == nil {
+		return fmt.Errorf("telegram client not configured")
+	}
+	return inner.EditMessage(
+		ctx, request.TelegramChatID, request.TelegramMessageID,
+		request.MessageText+"\n\n"+suffix, nil,
+	)
 }
 
 // AnswerCallback acknowledges a callback query with a short toast text.

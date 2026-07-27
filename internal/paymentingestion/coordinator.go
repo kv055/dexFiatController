@@ -5,6 +5,7 @@ package paymentingestion
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"sync"
@@ -23,6 +24,11 @@ type Processor interface {
 	Record(context.Context, paymentevents.PaymentEvent, string) (int64, bool, error)
 	Match(context.Context, paymentevents.PaymentEvent, time.Time) (*paymentevents.Candidate, []paymentevents.Candidate, []paymentevents.Candidate, error)
 	Complete(context.Context, paymentevents.PaymentEvent, int64, paymentevents.Candidate) (paymentevents.CompletionResult, error)
+	CompleteSelected(context.Context, paymentevents.PaymentEvent, int64, paymentevents.Candidate) (paymentevents.CompletionResult, error)
+	MarkConfirmationDelivered(context.Context, int64, string, int64) error
+	MarkConfirmationDeliveryError(context.Context, int64, string) error
+	PendingConfirmationRequests(context.Context) ([]paymentevents.PaymentConfirmationRequest, error)
+	DecideConfirmation(context.Context, int64, string, bool) (paymentevents.CompletionResult, paymentevents.PaymentConfirmationRequest, error)
 	Update(context.Context, int64, string, *uint, string) error
 }
 
@@ -35,6 +41,7 @@ type Escalator interface {
 	Enabled() bool
 	SendClassify(context.Context, string, paymentevents.Presentation) error
 	SendPick(context.Context, string, paymentevents.Presentation, []paymentevents.Candidate) error
+	SendPaymentConfirmation(context.Context, paymentevents.PaymentConfirmationRequest) (string, int64, error)
 }
 
 type OutcomeKind string
@@ -46,13 +53,17 @@ const (
 	OutcomeUnmatched             OutcomeKind = "unmatched"
 	OutcomeAwaitingClassify      OutcomeKind = "awaiting_classification"
 	OutcomeAwaitingSelection     OutcomeKind = "awaiting_selection"
+	OutcomeAwaitingConfirmation  OutcomeKind = "awaiting_payment_confirmation"
 	OutcomeNoClassification      OutcomeKind = "unclassified_no_escalation"
 	OutcomeNoSelection           OutcomeKind = "ambiguous_no_escalation"
+	OutcomeNoConfirmation        OutcomeKind = "confirmation_no_escalation"
 	OutcomeListError             OutcomeKind = "list_error"
 	OutcomeTelegramError         OutcomeKind = "telegram_error"
 	OutcomeUserAllowed           OutcomeKind = "user_allowed"
 	OutcomeUserDenied            OutcomeKind = "user_denied"
 	OutcomePicked                OutcomeKind = "picked"
+	OutcomePaymentApproved       OutcomeKind = "payment_approved"
+	OutcomePaymentRejected       OutcomeKind = "payment_rejected"
 	OutcomeWaitingChannels       OutcomeKind = "waiting_channels"
 	OutcomeDuplicateConfirmation OutcomeKind = "duplicate_confirmation"
 	OutcomeReleased              OutcomeKind = "released"
@@ -229,7 +240,17 @@ func (c *Coordinator) match(ctx context.Context, receipt Receipt) error {
 }
 
 func (c *Coordinator) complete(ctx context.Context, receipt Receipt, candidate paymentevents.Candidate) error {
-	result, err := c.processor.Complete(ctx, receipt.Signal.Event, receipt.EventID, candidate)
+	return c.completeWithSelection(ctx, receipt, candidate, false)
+}
+
+func (c *Coordinator) completeWithSelection(ctx context.Context, receipt Receipt, candidate paymentevents.Candidate, selected bool) error {
+	var result paymentevents.CompletionResult
+	var err error
+	if selected {
+		result, err = c.processor.CompleteSelected(ctx, receipt.Signal.Event, receipt.EventID, candidate)
+	} else {
+		result, err = c.processor.Complete(ctx, receipt.Signal.Event, receipt.EventID, candidate)
+	}
 	outcome := Outcome{
 		EventID: receipt.EventID, TxID: &candidate.ID,
 		Required: result.Required, Present: result.Present,
@@ -246,6 +267,8 @@ func (c *Coordinator) complete(ctx context.Context, receipt Receipt, candidate p
 	switch result.State {
 	case paymentevents.CompletionWaiting:
 		outcome.Kind = OutcomeWaitingChannels
+	case paymentevents.CompletionManual:
+		return c.escalatePaymentConfirmation(ctx, receipt, result)
 	case paymentevents.CompletionDuplicate:
 		outcome.Kind = OutcomeDuplicateConfirmation
 	default:
@@ -253,6 +276,119 @@ func (c *Coordinator) complete(ctx context.Context, receipt Receipt, candidate p
 	}
 	c.report(ctx, receipt.Signal, outcome)
 	return nil
+}
+
+func (c *Coordinator) escalatePaymentConfirmation(ctx context.Context, receipt Receipt, result paymentevents.CompletionResult) error {
+	if result.Request == nil {
+		return fmt.Errorf("payment ingestion: manual confirmation result has no request")
+	}
+	request := *result.Request
+	pendingID := strconv.FormatInt(request.ID, 36)
+	outcome := Outcome{
+		Kind: OutcomeAwaitingConfirmation, EventID: receipt.EventID,
+		TxID: &request.TransactionID, PendingID: pendingID,
+		Required: result.Required, Present: result.Present,
+	}
+	c.report(ctx, receipt.Signal, outcome)
+	if c.escalator == nil || !c.escalator.Enabled() {
+		reason := "telegram client not configured"
+		_ = c.processor.MarkConfirmationDeliveryError(ctx, request.ID, reason)
+		outcome.Kind, outcome.Reason = OutcomeNoConfirmation, reason
+		c.report(ctx, receipt.Signal, outcome)
+		return nil
+	}
+	chatID, messageID, err := c.escalator.SendPaymentConfirmation(ctx, request)
+	if err != nil {
+		_ = c.processor.MarkConfirmationDeliveryError(ctx, request.ID, err.Error())
+		outcome.Kind, outcome.Reason = OutcomeTelegramError, err.Error()
+		c.report(ctx, receipt.Signal, outcome)
+		return err
+	}
+	if err := c.processor.MarkConfirmationDelivered(ctx, request.ID, chatID, messageID); err != nil {
+		outcome.Kind, outcome.Reason = OutcomeTelegramError, err.Error()
+		c.report(ctx, receipt.Signal, outcome)
+		return err
+	}
+	return nil
+}
+
+func (c *Coordinator) DecidePaymentConfirmation(ctx context.Context, requestID int64, chatID string, allow bool) (paymentevents.CompletionResult, paymentevents.PaymentConfirmationRequest, error) {
+	result, request, err := c.processor.DecideConfirmation(ctx, requestID, chatID, allow)
+	if err != nil {
+		if request.ID != 0 && (result.Advanced || result.State == paymentevents.CompletionFailed) {
+			kind := OutcomeConfirmationError
+			if result.Advanced {
+				kind = OutcomeReleaseError
+			}
+			c.report(ctx, requestSignal(request), Outcome{
+				Kind: kind, EventID: request.PaymentEventID,
+				TxID: &request.TransactionID, Reason: err.Error(),
+			})
+		}
+		return result, request, err
+	}
+	outcome := Outcome{
+		EventID: request.PaymentEventID, TxID: &request.TransactionID,
+		PendingID: strconv.FormatInt(request.ID, 36),
+		Required:  result.Required, Present: result.Present,
+	}
+	if !allow {
+		outcome.Kind = OutcomePaymentRejected
+		c.report(ctx, requestSignal(request), outcome)
+		return result, request, nil
+	}
+	switch result.State {
+	case paymentevents.CompletionWaiting:
+		outcome.Kind = OutcomeWaitingChannels
+	case paymentevents.CompletionDuplicate:
+		outcome.Kind = OutcomeDuplicateConfirmation
+	case paymentevents.CompletionReleased:
+		outcome.Kind = OutcomeReleased
+	default:
+		outcome.Kind = OutcomePaymentApproved
+	}
+	c.report(ctx, requestSignal(request), outcome)
+	return result, request, nil
+}
+
+func (c *Coordinator) RetryPendingConfirmations(ctx context.Context) error {
+	if c.escalator == nil || !c.escalator.Enabled() {
+		return nil
+	}
+	requests, err := c.processor.PendingConfirmationRequests(ctx)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, request := range requests {
+		chatID, messageID, sendErr := c.escalator.SendPaymentConfirmation(ctx, request)
+		if sendErr == nil {
+			sendErr = c.processor.MarkConfirmationDelivered(ctx, request.ID, chatID, messageID)
+		}
+		if sendErr != nil {
+			_ = c.processor.MarkConfirmationDeliveryError(ctx, request.ID, sendErr.Error())
+			if firstErr == nil {
+				firstErr = sendErr
+			}
+		}
+	}
+	return firstErr
+}
+
+func requestSignal(request paymentevents.PaymentConfirmationRequest) paymentevents.InboundSignal {
+	signal := paymentevents.InboundSignal{
+		Event: request.Event,
+		Presentation: paymentevents.Presentation{
+			App: request.Event.Provider, Text: request.Event.Description,
+		},
+	}
+	var audit struct {
+		PushLogID int64 `json:"push_log_id"`
+	}
+	if json.Unmarshal(request.Event.AuditMetadata, &audit) == nil {
+		signal.AuditID = audit.PushLogID
+	}
+	return signal
 }
 
 func (c *Coordinator) escalateClassification(ctx context.Context, receipt Receipt) error {
@@ -313,7 +449,7 @@ func (c *Coordinator) DecideSelection(ctx context.Context, id string, txID uint)
 	for _, candidate := range entry.candidates {
 		if candidate.ID == txID {
 			c.report(ctx, entry.receipt.Signal, Outcome{Kind: OutcomePicked, EventID: entry.receipt.EventID, TxID: &candidate.ID})
-			return c.complete(ctx, entry.receipt, candidate)
+			return c.completeWithSelection(ctx, entry.receipt, candidate, true)
 		}
 	}
 	return fmt.Errorf("candidate not found")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -43,7 +44,7 @@ func (p *Processor) Match(ctx context.Context, event PaymentEvent, now time.Time
 }
 
 func (p *Processor) Confirm(ctx context.Context, event PaymentEvent, eventID int64, candidate Candidate, evidence json.RawMessage) (ConfirmationResult, error) {
-	return p.store.Confirm(ctx, event, eventID, candidate.ID, evidence)
+	return p.store.Confirm(ctx, event, eventID, candidate.ID, evidence, 0, false)
 }
 
 func (p *Processor) Update(ctx context.Context, eventID int64, status string, txID *uint, errText string) error {
@@ -54,6 +55,8 @@ type CompletionState string
 
 const (
 	CompletionWaiting   CompletionState = "waiting"
+	CompletionManual    CompletionState = "manual_confirmation"
+	CompletionRejected  CompletionState = "rejected"
 	CompletionDuplicate CompletionState = "duplicate"
 	CompletionReleased  CompletionState = "released"
 	CompletionFailed    CompletionState = "failed"
@@ -68,13 +71,28 @@ type CompletionResult struct {
 // channels and requests release exactly when this call atomically advances the
 // transaction. Both push and email adapters enter this method.
 func (p *Processor) Complete(ctx context.Context, event PaymentEvent, eventID int64, candidate Candidate) (CompletionResult, error) {
+	return p.complete(ctx, event, eventID, candidate, 0, false)
+}
+
+func (p *Processor) CompleteSelected(ctx context.Context, event PaymentEvent, eventID int64, candidate Candidate) (CompletionResult, error) {
+	return p.complete(ctx, event, eventID, candidate, 0, true)
+}
+
+func (p *Processor) complete(ctx context.Context, event PaymentEvent, eventID int64, candidate Candidate, approvalRequestID int64, forceManual bool) (CompletionResult, error) {
 	txID := candidate.ID
-	confirmation, err := p.Confirm(ctx, event, eventID, candidate, buildEvidence(event, candidate))
+	confirmation, err := p.store.Confirm(ctx, event, eventID, candidate.ID, buildEvidence(event, candidate), approvalRequestID, forceManual)
 	if err != nil {
-		_ = p.Update(ctx, eventID, "rejected", &txID, err.Error())
+		if approvalRequestID == 0 {
+			_ = p.Update(ctx, eventID, "rejected", &txID, err.Error())
+		}
 		return CompletionResult{ConfirmationResult: confirmation, State: CompletionFailed}, err
 	}
 	result := CompletionResult{ConfirmationResult: confirmation}
+	if confirmation.ManualRequired {
+		result.State = CompletionManual
+		_ = p.Update(ctx, eventID, "awaiting_user_confirmation", &txID, "")
+		return result, nil
+	}
 	if !confirmation.Ready {
 		result.State = CompletionWaiting
 		_ = p.Update(ctx, eventID, "confirmed_waiting", &txID, "")
@@ -98,6 +116,49 @@ func (p *Processor) Complete(ctx context.Context, event PaymentEvent, eventID in
 	result.State = CompletionReleased
 	_ = p.Update(ctx, eventID, "released", &txID, "")
 	return result, nil
+}
+
+func (p *Processor) MarkConfirmationDelivered(ctx context.Context, requestID int64, chatID string, messageID int64) error {
+	return p.store.MarkConfirmationDelivered(ctx, requestID, chatID, messageID)
+}
+
+func (p *Processor) MarkConfirmationDeliveryError(ctx context.Context, requestID int64, text string) error {
+	return p.store.MarkConfirmationDeliveryError(ctx, requestID, text)
+}
+
+func (p *Processor) PendingConfirmationRequests(ctx context.Context) ([]PaymentConfirmationRequest, error) {
+	return p.store.PendingConfirmationRequests(ctx)
+}
+
+func (p *Processor) DecideConfirmation(ctx context.Context, requestID int64, chatID string, allow bool) (CompletionResult, PaymentConfirmationRequest, error) {
+	request, err := p.store.LoadConfirmationRequest(ctx, requestID)
+	if err != nil {
+		return CompletionResult{}, request, err
+	}
+	if request.DecisionStatus != confirmationDecisionPending {
+		return CompletionResult{}, request, fmt.Errorf("payment events: confirmation request is already handled")
+	}
+	if request.TransactionStatus != statusDexPositionTaken {
+		expired, expireErr := p.store.RejectConfirmation(ctx, requestID)
+		if expireErr == nil {
+			request = expired
+		}
+		return CompletionResult{}, request, fmt.Errorf("payment events: confirmation request expired because the transaction is no longer pending")
+	}
+	if request.TelegramChatID != "" && strings.TrimSpace(chatID) != request.TelegramChatID {
+		return CompletionResult{}, request, fmt.Errorf("payment events: confirmation callback came from the wrong Telegram chat")
+	}
+	if !allow {
+		request, err = p.store.RejectConfirmation(ctx, requestID)
+		if err != nil {
+			return CompletionResult{}, request, err
+		}
+		return CompletionResult{State: CompletionRejected}, request, nil
+	}
+	result, err := p.complete(
+		ctx, request.Event, request.PaymentEventID, request.Candidate, requestID, false,
+	)
+	return result, request, err
 }
 
 func buildEvidence(event PaymentEvent, candidate Candidate) json.RawMessage {

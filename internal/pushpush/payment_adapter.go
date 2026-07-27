@@ -1,6 +1,7 @@
 package pushpush
 
 import (
+	"encoding/json"
 	"math"
 	"strings"
 	"time"
@@ -23,6 +24,10 @@ func PaymentSignal(n Notification, raw []byte, sourceEventID string, received ti
 	if providerTime.IsZero() {
 		providerTime = received.UTC()
 	}
+	var audit json.RawMessage
+	if auditID > 0 {
+		audit, _ = json.Marshal(map[string]int64{"push_log_id": auditID})
+	}
 	return paymentevents.InboundSignal{
 		Event: PaymentEvent{
 			Source:            paymentevents.SourcePush,
@@ -35,6 +40,7 @@ func PaymentSignal(n Notification, raw []byte, sourceEventID string, received ti
 			ProviderTimestamp: providerTime,
 			ReceivedTimestamp: received.UTC(),
 			RawMessageHash:    paymentevents.EventIDFromBytes(raw),
+			AuditMetadata:     audit,
 		},
 		Presentation: paymentevents.Presentation{
 			App: n.App, Title: n.Title, Text: n.Text,

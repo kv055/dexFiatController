@@ -105,6 +105,35 @@ func TestAmbiguousSignalSelectionAndZeroMatchRouting(t *testing.T) {
 	}
 }
 
+func TestManualConfirmationIsDeliveredBeforeCompletion(t *testing.T) {
+	request := &paymentevents.PaymentConfirmationRequest{
+		ID: 99, TransactionID: 7, PaymentEventID: 1,
+		MessageText: "confirm transaction",
+	}
+	processor := &fakeProcessor{
+		candidate: &paymentevents.Candidate{ID: 7},
+		completion: paymentevents.CompletionResult{
+			State: paymentevents.CompletionManual,
+			ConfirmationResult: paymentevents.ConfirmationResult{
+				ManualRequired: true, Request: request,
+			},
+		},
+	}
+	escalator := &fakeEscalator{enabled: true}
+	reporter := &fakeReporter{}
+	coordinator := New(processor, &fakeClassifier{}, escalator, reporter)
+
+	if _, err := coordinator.Handle(context.Background(), emailSignal(true, ModeActive)); err != nil {
+		t.Fatal(err)
+	}
+	if escalator.confirmCalls != 1 || processor.deliveredRequest != 99 {
+		t.Fatalf("confirm calls=%d delivered=%d", escalator.confirmCalls, processor.deliveredRequest)
+	}
+	if reporter.last().Kind != OutcomeAwaitingConfirmation {
+		t.Fatalf("outcome=%q", reporter.last().Kind)
+	}
+}
+
 func emailSignal(valid bool, mode string) paymentevents.InboundSignal {
 	now := time.Now().UTC()
 	reason := ""
@@ -149,6 +178,10 @@ type fakeProcessor struct {
 	ambiguous          []paymentevents.Candidate
 	candidates         []paymentevents.Candidate
 	completion         paymentevents.CompletionResult
+	decisionResult     paymentevents.CompletionResult
+	decisionRequest    paymentevents.PaymentConfirmationRequest
+	deliveredRequest   int64
+	deliveryError      string
 }
 
 func (f *fakeProcessor) Record(context.Context, paymentevents.PaymentEvent, string) (int64, bool, error) {
@@ -167,8 +200,32 @@ func (f *fakeProcessor) Complete(_ context.Context, _ paymentevents.PaymentEvent
 	return f.completion, nil
 }
 
+func (f *fakeProcessor) CompleteSelected(_ context.Context, _ paymentevents.PaymentEvent, _ int64, candidate paymentevents.Candidate) (paymentevents.CompletionResult, error) {
+	f.completeCalls++
+	f.completedCandidate = candidate.ID
+	return f.completion, nil
+}
+
 func (f *fakeProcessor) Update(context.Context, int64, string, *uint, string) error {
 	return nil
+}
+
+func (f *fakeProcessor) MarkConfirmationDelivered(_ context.Context, requestID int64, _ string, _ int64) error {
+	f.deliveredRequest = requestID
+	return nil
+}
+
+func (f *fakeProcessor) MarkConfirmationDeliveryError(_ context.Context, _ int64, text string) error {
+	f.deliveryError = text
+	return nil
+}
+
+func (f *fakeProcessor) PendingConfirmationRequests(context.Context) ([]paymentevents.PaymentConfirmationRequest, error) {
+	return nil, nil
+}
+
+func (f *fakeProcessor) DecideConfirmation(context.Context, int64, string, bool) (paymentevents.CompletionResult, paymentevents.PaymentConfirmationRequest, error) {
+	return f.decisionResult, f.decisionRequest, nil
 }
 
 type fakeClassifier struct {
@@ -184,6 +241,7 @@ type fakeEscalator struct {
 	enabled       bool
 	classifyCalls int
 	pickCalls     int
+	confirmCalls  int
 	lastID        string
 }
 
@@ -197,6 +255,11 @@ func (f *fakeEscalator) SendPick(_ context.Context, id string, _ paymentevents.P
 	f.pickCalls++
 	f.lastID = id
 	return nil
+}
+func (f *fakeEscalator) SendPaymentConfirmation(_ context.Context, request paymentevents.PaymentConfirmationRequest) (string, int64, error) {
+	f.confirmCalls++
+	f.lastID = request.MessageText
+	return "123", 456, nil
 }
 
 type fakeReporter struct {

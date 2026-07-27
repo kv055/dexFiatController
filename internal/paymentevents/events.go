@@ -111,10 +111,11 @@ func NewEventStore(db *sql.DB) (*EventStore, error) {
 	if db == nil {
 		return nil, fmt.Errorf("payment events: event store requires a non-nil db")
 	}
-	if _, err := db.Exec(fiatPaymentEventsSchema); err != nil {
+	if _, err := db.Exec(fiatPaymentEventsSchema + paymentConfirmationRequestsSchema); err != nil {
 		var exists bool
 		checkErr := db.QueryRow(`SELECT to_regclass('public.fiat_payment_events') IS NOT NULL
-			AND to_regclass('public.fiat_transaction_confirmations') IS NOT NULL`).Scan(&exists)
+			AND to_regclass('public.fiat_transaction_confirmations') IS NOT NULL
+			AND to_regclass('public.fiat_payment_confirmation_requests') IS NOT NULL`).Scan(&exists)
 		if checkErr != nil || !exists {
 			return nil, fmt.Errorf("payment events: ensure payment event schema: %w", err)
 		}
@@ -204,16 +205,18 @@ func (s *EventStore) UpdateStatus(ctx context.Context, id int64, status string, 
 
 // ConfirmationResult describes the channel gate after recording one event.
 type ConfirmationResult struct {
-	Required []string
-	Present  []string
-	Ready    bool
-	Advanced bool
+	Required       []string
+	Present        []string
+	Ready          bool
+	Advanced       bool
+	ManualRequired bool
+	Request        *PaymentConfirmationRequest
 }
 
 // Confirm atomically locks the transaction, validates that the event belongs
 // to the account linked by its canonical payment method, records the channel,
 // and advances only when every currently selected channel is present.
-func (s *EventStore) Confirm(ctx context.Context, event PaymentEvent, eventID int64, txID uint, evidence json.RawMessage) (ConfirmationResult, error) {
+func (s *EventStore) Confirm(ctx context.Context, event PaymentEvent, eventID int64, txID uint, evidence json.RawMessage, approvalRequestID int64, forceManual bool) (ConfirmationResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ConfirmationResult{}, fmt.Errorf("payment events: begin confirmation: %w", err)
@@ -224,17 +227,26 @@ func (s *EventStore) Confirm(ctx context.Context, event PaymentEvent, eventID in
 	}
 
 	var accountID int64
-	var provider, channels, status string
+	var provider, channels, status, dex, paymentMethod string
+	var fiatAmount float64
+	var fiatCurrency string
+	var counterparty sql.NullString
+	var pendingSince time.Time
 	err = tx.QueryRowContext(ctx, `
 		SELECT a.id, a.provider,
 		       COALESCE(array_to_string(a.notification_channels::text[], ','), ''),
-		       t.status
+		       t.status, t.fiat_amount, t.fiat_currency, COALESCE(t.dex, ''),
+		       COALESCE(t.payment_method, ''), t.counterparty_payment_info,
+		       COALESCE(NULLIF(t.dex_offer_taken, '0001-01-01'::timestamptz), t.created_at)
 		FROM transactions t
 		JOIN payment_methods pm ON lower(pm.name)=lower(t.payment_method)
 		LEFT JOIN bank_accounts ba ON ba.id=pm.bank_account_id
 		JOIN accounts a ON a.id=COALESCE(pm.account_id, ba.account_id) AND a.is_active
 		WHERE t.id=$1 AND t.deleted_at IS NULL AND pm.is_active
-	`, txID).Scan(&accountID, &provider, &channels, &status)
+	`, txID).Scan(
+		&accountID, &provider, &channels, &status, &fiatAmount, &fiatCurrency,
+		&dex, &paymentMethod, &counterparty, &pendingSince,
+	)
 	if err != nil {
 		return ConfirmationResult{}, fmt.Errorf("payment events: resolve transaction payment account: %w", err)
 	}
@@ -254,12 +266,65 @@ func (s *EventStore) Confirm(ctx context.Context, event PaymentEvent, eventID in
 	if status != statusDexPositionTaken {
 		return ConfirmationResult{Required: required}, fmt.Errorf("payment events: transaction %d is not pending fiat (status %s)", txID, status)
 	}
+	candidate := Candidate{
+		ID: txID, FiatAmount: fiatAmount, FiatCurrency: fiatCurrency,
+		Dex: dex, PaymentMethod: paymentMethod, AccountID: accountID,
+		AccountProvider: provider, NotificationChannels: required,
+		PendingSince: pendingSince,
+	}
+	if counterparty.Valid {
+		candidate.CounterpartyPaymentInfo = json.RawMessage(counterparty.String)
+	}
+
+	if approvalRequestID > 0 {
+		var requestEventID, requestTxID int64
+		var requestStatus string
+		err := tx.QueryRowContext(ctx, `
+			SELECT payment_event_id, transaction_id, decision_status
+			FROM fiat_payment_confirmation_requests
+			WHERE id=$1
+			FOR UPDATE
+		`, approvalRequestID).Scan(&requestEventID, &requestTxID, &requestStatus)
+		if err != nil {
+			return ConfirmationResult{}, fmt.Errorf("payment events: load confirmation request: %w", err)
+		}
+		if requestStatus != confirmationDecisionPending ||
+			requestEventID != eventID || requestTxID != int64(txID) {
+			return ConfirmationResult{}, fmt.Errorf("payment events: confirmation request is already handled or does not match")
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE fiat_payment_events
 		SET account_id=$1, matched_transaction_id=$2, updated_at=CURRENT_TIMESTAMP
 		WHERE id=$3
 	`, accountID, txID, eventID); err != nil {
 		return ConfirmationResult{}, fmt.Errorf("payment events: bind payment event to account: %w", err)
+	}
+
+	present, otherEvent, err := listConfirmationStateTx(ctx, tx, txID, accountID, event.Source)
+	if err != nil {
+		return ConfirmationResult{}, err
+	}
+	if approvalRequestID == 0 {
+		reason, mismatches := manualConfirmationReason(event, otherEvent, required)
+		if forceManual {
+			reason = ConfirmationReasonUserSelection
+		}
+		if reason != "" {
+			request, requestErr := createPaymentConfirmationRequestTx(
+				ctx, tx, candidate, event, eventID, otherEvent, reason, mismatches,
+			)
+			if requestErr != nil {
+				return ConfirmationResult{}, requestErr
+			}
+			if err := tx.Commit(); err != nil {
+				return ConfirmationResult{}, err
+			}
+			return ConfirmationResult{
+				Required: required, Present: present,
+				ManualRequired: true, Request: &request,
+			}, nil
+		}
 	}
 
 	if _, err := tx.ExecContext(ctx, `
@@ -270,27 +335,18 @@ func (s *EventStore) Confirm(ctx context.Context, event PaymentEvent, eventID in
 	`, txID, accountID, event.Source, eventID); err != nil {
 		return ConfirmationResult{}, fmt.Errorf("payment events: record %s confirmation: %w", event.Source, err)
 	}
-	rows, err := tx.QueryContext(ctx, `
-		SELECT channel FROM fiat_transaction_confirmations
-		WHERE transaction_id=$1 AND account_id=$2
-	`, txID, accountID)
+	present, _, err = listConfirmationStateTx(ctx, tx, txID, accountID, "")
 	if err != nil {
-		return ConfirmationResult{}, fmt.Errorf("payment events: list transaction confirmations: %w", err)
+		return ConfirmationResult{}, err
 	}
-	var present []string
-	for rows.Next() {
-		var channel string
-		if err := rows.Scan(&channel); err != nil {
-			rows.Close()
-			return ConfirmationResult{}, err
-		}
-		present = append(present, channel)
-	}
-	rows.Close()
-	sort.Strings(present)
 
 	result := ConfirmationResult{Required: required, Present: present}
 	if !AllChannelsPresent(required, present) {
+		if approvalRequestID > 0 {
+			if err := markPaymentConfirmationApprovedTx(ctx, tx, approvalRequestID); err != nil {
+				return ConfirmationResult{}, err
+			}
+		}
 		if err := tx.Commit(); err != nil {
 			return ConfirmationResult{}, err
 		}
@@ -313,6 +369,11 @@ func (s *EventStore) Confirm(ctx context.Context, event PaymentEvent, eventID in
 		return ConfirmationResult{}, err
 	}
 	result.Advanced = count == 1
+	if approvalRequestID > 0 {
+		if err := markPaymentConfirmationApprovedTx(ctx, tx, approvalRequestID); err != nil {
+			return ConfirmationResult{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return ConfirmationResult{}, err
 	}
