@@ -43,6 +43,7 @@ type Server struct {
 	capture       *RawCapture
 	heartbeat     *HeartbeatStore
 	heartbeatLogs heartbeatLogger
+	attempts      *CallbackAttemptStore
 	emailHealth   *paymentemail.EmailHealth
 	emailReader   *paymentemail.EmailReader
 
@@ -104,6 +105,11 @@ func New(cfg Config) (*Server, error) {
 		_ = store.Close()
 		return nil, err
 	}
+	attempts, err := NewCallbackAttemptStore(store.DB())
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 
 	logger, err := NewLogger(filepath.Join(cfg.DataDir, "notifications.jsonl"))
 	if err != nil {
@@ -136,6 +142,7 @@ func New(cfg Config) (*Server, error) {
 		telegramVersion: tgVersion,
 		heartbeat:       heartbeat,
 		heartbeatLogs:   heartbeatLogs,
+		attempts:        attempts,
 		emailHealth:     emailHealth,
 	}
 	srv.ingestion = paymentingestion.New(processor, rules, telegramClient, srv)
@@ -167,12 +174,14 @@ func (s *Server) Run(ctx context.Context) error {
 		mux.HandleFunc("GET /health", s.handleHealth)
 		mux.HandleFunc("POST /phone-heartbeat", s.handlePhoneHeartbeat)
 		mux.HandleFunc("GET /phone-heartbeat", s.handlePhoneHeartbeatStatus)
+		mux.HandleFunc("GET /phone-callback-history", s.handlePhoneCallbackHistory)
 		mux.HandleFunc("GET /notification-health", s.handleNotificationHealth)
 		mux.HandleFunc("/{path...}", s.handleCapture)
 	} else {
 		mux.HandleFunc("POST /notify", s.handleNotify)
 		mux.HandleFunc("POST /phone-heartbeat", s.handlePhoneHeartbeat)
 		mux.HandleFunc("GET /phone-heartbeat", s.handlePhoneHeartbeatStatus)
+		mux.HandleFunc("GET /phone-callback-history", s.handlePhoneCallbackHistory)
 		mux.HandleFunc("GET /notification-health", s.handleNotificationHealth)
 		mux.HandleFunc("POST /telegram-webhook", s.handleTelegramWebhook)
 		mux.HandleFunc("GET /health", s.handleHealth)
@@ -250,6 +259,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 // handlePhoneHeartbeat records a check-in from the phone running MacroDroid.
 func (s *Server) handlePhoneHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeHeartbeat(r) {
+		s.recordCallbackAttempt(r.Context(), CallbackAttempt{Endpoint: "phone-heartbeat", Outcome: "blocked", StatusCode: http.StatusUnauthorized, Detail: "unauthorized"})
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
@@ -258,11 +268,13 @@ func (s *Server) handlePhoneHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Body != nil {
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&request); err != nil && !errors.Is(err, io.EOF) {
+			s.recordCallbackAttempt(r.Context(), CallbackAttempt{Endpoint: "phone-heartbeat", Outcome: "invalid", StatusCode: http.StatusBadRequest, Detail: "invalid JSON body"})
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 			return
 		}
 	}
 	if !validDeviceID(request.DeviceID) {
+		s.recordCallbackAttempt(r.Context(), CallbackAttempt{Endpoint: "phone-heartbeat", Outcome: "invalid", StatusCode: http.StatusBadRequest, DeviceID: strings.TrimSpace(request.DeviceID), Detail: "invalid device_id"})
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "device_id is required and must be at most 128 characters"})
 		return
 	}
@@ -282,6 +294,7 @@ func (s *Server) handlePhoneHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "record heartbeat"})
 		return
 	}
+	s.recordCallbackAttempt(r.Context(), CallbackAttempt{Endpoint: "phone-heartbeat", Outcome: "accepted", StatusCode: http.StatusOK, DeviceID: deviceID})
 	writeJSON(w, http.StatusOK, map[string]any{"online": true, "device_id": heartbeat.DeviceID, "last_seen": heartbeat.LastSeen})
 }
 
@@ -299,6 +312,25 @@ func (s *Server) handlePhoneHeartbeatStatus(w http.ResponseWriter, r *http.Reque
 		"last_seen":       heartbeat.LastSeen,
 		"max_age_seconds": int64(s.cfg.HeartbeatMaxAge.Seconds()),
 	})
+}
+
+func (s *Server) handlePhoneCallbackHistory(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeHeartbeat(r) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if s.attempts == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "callback history unavailable"})
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	attempts, err := s.attempts.List(r.Context(), limit)
+	if err != nil {
+		log.Printf("pushpush: list callback history: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "list callback history"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"attempts": attempts})
 }
 
 // handleNotificationHealth reports every channel selected on the account linked
@@ -363,11 +395,13 @@ func (s *Server) handleCapture(w http.ResponseWriter, r *http.Request) {
 // pipeline runs, so the row exists regardless of downstream outcome.
 func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeNotify(r) {
+		s.recordCallbackAttempt(r.Context(), CallbackAttempt{Endpoint: "notify", Outcome: "blocked", StatusCode: http.StatusUnauthorized, Detail: "unauthorized"})
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
 	rawBody, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil {
+		s.recordCallbackAttempt(r.Context(), CallbackAttempt{Endpoint: "notify", Outcome: "invalid", StatusCode: http.StatusBadRequest, Detail: "read body"})
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("read body: %v", err)})
 		return
 	}
@@ -380,6 +414,7 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	jsonObj, isJSON := extractJSONObject(rawBody)
 	if isJSON {
 		if err := json.Unmarshal(jsonObj, &n); err != nil {
+			s.recordCallbackAttempt(r.Context(), CallbackAttempt{Endpoint: "notify", Outcome: "invalid", StatusCode: http.StatusBadRequest, Detail: "decode notification"})
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("decode notification: %v", err)})
 			return
 		}
@@ -418,20 +453,32 @@ func (s *Server) handleNotify(w http.ResponseWriter, r *http.Request) {
 	signal := PaymentSignal(n, rawBody, r.Header.Get("X-Event-ID"), time.Now(), logID)
 	receipt, eventErr := s.ingestion.Accept(r.Context(), signal)
 	if eventErr != nil {
+		s.recordCallbackAttempt(r.Context(), CallbackAttempt{Endpoint: "notify", Outcome: "error", StatusCode: http.StatusInternalServerError, App: n.App, Detail: "persist payment event"})
 		s.updateLog(r.Context(), logID, LogUpdate{Status: LogMarkError, Error: eventErr.Error()})
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "persist payment event"})
 		return
 	}
 	if receipt.Duplicate {
+		s.recordCallbackAttempt(r.Context(), CallbackAttempt{Endpoint: "notify", Outcome: "accepted", StatusCode: http.StatusOK, App: n.App, Detail: "duplicate"})
 		writeJSON(w, http.StatusOK, map[string]any{"accepted": true, "duplicate": true, "event_id": receipt.EventID, "log_id": logID})
 		return
 	}
+	s.recordCallbackAttempt(r.Context(), CallbackAttempt{Endpoint: "notify", Outcome: "accepted", StatusCode: http.StatusAccepted, App: n.App})
 	go func() {
 		if err := s.ingestion.Process(context.Background(), receipt); err != nil {
 			log.Printf("payment ingestion: process push signal: %v", err)
 		}
 	}()
 	writeJSON(w, http.StatusAccepted, map[string]any{"accepted": true, "event_id": receipt.EventID, "log_id": logID})
+}
+
+func (s *Server) recordCallbackAttempt(ctx context.Context, attempt CallbackAttempt) {
+	if s.attempts == nil {
+		return
+	}
+	if err := s.attempts.Record(ctx, attempt); err != nil {
+		log.Printf("pushpush: record callback attempt: %v", err)
+	}
 }
 
 func (s *Server) authorizeNotify(r *http.Request) bool {
