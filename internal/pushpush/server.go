@@ -486,7 +486,7 @@ func (s *Server) authorizeNotify(r *http.Request) bool {
 }
 
 func (s *Server) authorizeHeartbeat(r *http.Request) bool {
-	return s.captureOnly || (s.cfg.HeartbeatSecret != "" && r.Header.Get("X-Webhook-Secret") == s.cfg.HeartbeatSecret)
+	return s.captureOnly || (s.cfg.NotifySecret != "" && r.Header.Get("X-Webhook-Secret") == s.cfg.NotifySecret)
 }
 
 // appFromUserAgent maps forwarder User-Agents to a stable app key. Forwarders

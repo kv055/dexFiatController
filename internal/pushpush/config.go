@@ -19,10 +19,6 @@ type Config struct {
 	// discovery mode accepts unauthenticated payloads.
 	NotifySecret string
 
-	// HeartbeatSecret authorizes phone heartbeat requests. When empty,
-	// LoadConfig falls back to NotifySecret so a MacroDroid installation only
-	// needs one shared secret by default.
-	HeartbeatSecret string
 	// HeartbeatMaxAge is how long a received heartbeat keeps the phone online.
 	HeartbeatMaxAge time.Duration
 
@@ -73,15 +69,9 @@ func LoadConfig() Config {
 		}
 	}
 	notifySecret := strings.TrimSpace(os.Getenv("PUSHPUSH_NOTIFY_SECRET"))
-	heartbeatSecret := strings.TrimSpace(os.Getenv("PUSHPUSH_HEARTBEAT_SECRET"))
-	if heartbeatSecret == "" {
-		heartbeatSecret = notifySecret
-	}
-
 	return Config{
 		Addr:            strings.TrimSpace(os.Getenv("PUSHPUSH_ADDR")),
 		NotifySecret:    notifySecret,
-		HeartbeatSecret: heartbeatSecret,
 		HeartbeatMaxAge: heartbeatMaxAge,
 		DataDir:         dataDir,
 		DatabaseURL:     strings.TrimSpace(os.Getenv("DATABASE_URL")),

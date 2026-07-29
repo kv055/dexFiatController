@@ -196,9 +196,9 @@ public callbacks on the dashboard hostname:
 | `POST` | `/pushpush/notify` | Ingest a selected banking-app notification. |
 | `POST` | `/pushpush/phone-heartbeat` | Record that the phone is online. |
 
-Both require `X-Webhook-Secret`. Normal PushPush operation fails closed if
-`PUSHPUSH_NOTIFY_SECRET` is unset. Set `PUSHPUSH_HEARTBEAT_SECRET` to a dedicated
-random value, or leave it unset to reuse `PUSHPUSH_NOTIFY_SECRET`.
+Both require the same `X-Webhook-Secret`. Normal PushPush operation fails closed if
+`PUSHPUSH_NOTIFY_SECRET` is unset. This one secret authorizes both notification and
+heartbeat callbacks.
 `PUSHPUSH_HEARTBEAT_MAX_AGE` controls when the phone is considered offline; it defaults
 to `15m`. The only exception is explicit local capture-only discovery mode, which is
 not a production callback configuration.
@@ -207,7 +207,6 @@ Add these settings to the Fiat Controller environment before deploying it:
 
 ```dotenv
 PUSHPUSH_NOTIFY_SECRET=<a-long-random-secret>
-PUSHPUSH_HEARTBEAT_SECRET=<optional-dedicated-secret>
 PUSHPUSH_HEARTBEAT_MAX_AGE=15m
 ```
 
@@ -232,7 +231,7 @@ notification access and remove the automation app from battery optimisation.
    | URL | `https://<dashboard-host>/pushpush/phone-heartbeat` |
    | Content type | `application/json` |
    | Request body | `{"device_id":"<stable-phone-name>"}` |
-   | Header | `X-Webhook-Secret: <PUSHPUSH_HEARTBEAT_SECRET>` |
+   | Header | `X-Webhook-Secret: <PUSHPUSH_NOTIFY_SECRET>` |
 
    The notification forwarder uses `POST https://<dashboard-host>/pushpush/notify` with
    JSON containing `app`, `title`, `text`, and optional `time`. The `device_id` is a label for operators, not a secret; use a
@@ -245,7 +244,7 @@ notification access and remove the automation app from battery optimisation.
 Check the current status from an authenticated machine:
 
 ```bash
-curl -H 'X-Webhook-Secret: <PUSHPUSH_HEARTBEAT_SECRET>' \
+curl -H 'X-Webhook-Secret: <PUSHPUSH_NOTIFY_SECRET>' \
   http://fiat-controller:8080/phone-heartbeat
 ```
 

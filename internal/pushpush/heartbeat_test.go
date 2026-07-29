@@ -23,10 +23,10 @@ func TestPhoneHeartbeatRecordsAndReportsOnline(t *testing.T) {
 		t.Fatalf("NewHeartbeatStore: %v", err)
 	}
 	logs := &fakeHeartbeatLogger{}
-	s := &Server{cfg: Config{HeartbeatSecret: "heartbeat-secret", HeartbeatMaxAge: time.Minute}, heartbeat: store, heartbeatLogs: logs}
+	s := &Server{cfg: Config{NotifySecret: "shared-secret", HeartbeatMaxAge: time.Minute}, heartbeat: store, heartbeatLogs: logs}
 
 	req := httptest.NewRequest(http.MethodPost, "/phone-heartbeat", strings.NewReader(`{"device_id":"payment-phone"}`))
-	req.Header.Set("X-Webhook-Secret", "heartbeat-secret")
+	req.Header.Set("X-Webhook-Secret", "shared-secret")
 	res := httptest.NewRecorder()
 	s.handlePhoneHeartbeat(res, req)
 	if res.Code != http.StatusOK {
@@ -37,7 +37,7 @@ func TestPhoneHeartbeatRecordsAndReportsOnline(t *testing.T) {
 	}
 
 	statusReq := httptest.NewRequest(http.MethodGet, "/phone-heartbeat", nil)
-	statusReq.Header.Set("X-Webhook-Secret", "heartbeat-secret")
+	statusReq.Header.Set("X-Webhook-Secret", "shared-secret")
 	statusRes := httptest.NewRecorder()
 	s.handlePhoneHeartbeatStatus(statusRes, statusReq)
 	if statusRes.Code != http.StatusOK || !strings.Contains(statusRes.Body.String(), `"online":true`) {
@@ -61,7 +61,7 @@ func TestPhoneHeartbeatRejectsWrongSecretAndReportsStale(t *testing.T) {
 	if _, err := store.Record("payment-phone", time.Now().Add(-2*time.Minute)); err != nil {
 		t.Fatalf("Record: %v", err)
 	}
-	s := &Server{cfg: Config{HeartbeatSecret: "heartbeat-secret", HeartbeatMaxAge: time.Minute}, heartbeat: store, heartbeatLogs: &fakeHeartbeatLogger{}}
+	s := &Server{cfg: Config{NotifySecret: "shared-secret", HeartbeatMaxAge: time.Minute}, heartbeat: store, heartbeatLogs: &fakeHeartbeatLogger{}}
 
 	unauthorized := httptest.NewRequest(http.MethodPost, "/phone-heartbeat", strings.NewReader(`{"device_id":"payment-phone"}`))
 	unauthorizedRes := httptest.NewRecorder()
@@ -71,7 +71,7 @@ func TestPhoneHeartbeatRejectsWrongSecretAndReportsStale(t *testing.T) {
 	}
 
 	statusReq := httptest.NewRequest(http.MethodGet, "/phone-heartbeat", nil)
-	statusReq.Header.Set("X-Webhook-Secret", "heartbeat-secret")
+	statusReq.Header.Set("X-Webhook-Secret", "shared-secret")
 	statusRes := httptest.NewRecorder()
 	s.handlePhoneHeartbeatStatus(statusRes, statusReq)
 	if statusRes.Code != http.StatusOK || !strings.Contains(statusRes.Body.String(), `"online":false`) {
