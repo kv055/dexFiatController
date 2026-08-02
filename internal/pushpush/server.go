@@ -169,22 +169,8 @@ func New(cfg Config) (*Server, error) {
 // Run serves HTTP until ctx is cancelled.
 func (s *Server) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
-	if s.captureOnly {
-		// Discovery mode: capture every request verbatim, regardless of path/method.
-		mux.HandleFunc("GET /health", s.handleHealth)
-		mux.HandleFunc("POST /phone-heartbeat", s.handlePhoneHeartbeat)
-		mux.HandleFunc("GET /phone-heartbeat", s.handlePhoneHeartbeatStatus)
-		mux.HandleFunc("GET /phone-callback-history", s.handlePhoneCallbackHistory)
-		mux.HandleFunc("GET /notification-health", s.handleNotificationHealth)
-		mux.HandleFunc("/{path...}", s.handleCapture)
-	} else {
-		mux.HandleFunc("POST /notify", s.handleNotify)
-		mux.HandleFunc("POST /phone-heartbeat", s.handlePhoneHeartbeat)
-		mux.HandleFunc("GET /phone-heartbeat", s.handlePhoneHeartbeatStatus)
-		mux.HandleFunc("GET /phone-callback-history", s.handlePhoneCallbackHistory)
-		mux.HandleFunc("GET /notification-health", s.handleNotificationHealth)
-		mux.HandleFunc("POST /telegram-webhook", s.handleTelegramWebhook)
-		mux.HandleFunc("GET /health", s.handleHealth)
+	s.registerRoutes(mux)
+	if !s.captureOnly {
 		// Hot-reload the shared Telegram bot config from the DB row.
 		go runTelegramSettingsPoller(ctx, s.store.DB(), s.tg, s.cfg.HTTPClient, s.telegramVersion)
 		go s.emailReader.Run(ctx)

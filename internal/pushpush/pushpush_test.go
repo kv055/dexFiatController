@@ -80,7 +80,7 @@ func TestRuleStoreRoundTrip(t *testing.T) {
 
 	// Reload from disk to verify persistence.
 	rs2 := NewRuleStore(path)
-	allowed, denied = rs2.Match("bankapp", "incoming wire from x")
+	allowed, _ = rs2.Match("bankapp", "incoming wire from x")
 	if !allowed {
 		t.Errorf("expected persisted allow rule to match after reload, got allowed=%v", allowed)
 	}
