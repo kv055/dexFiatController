@@ -492,8 +492,7 @@ func loadPaymentConfirmationRequest(ctx context.Context, q rowQuerier, requestID
 		JOIN fiat_payment_events e ON e.id=r.payment_event_id
 		JOIN transactions t ON t.id=r.transaction_id
 		JOIN payment_methods pm ON lower(pm.name)=lower(t.payment_method)
-		LEFT JOIN bank_accounts ba ON ba.id=pm.bank_account_id
-		JOIN accounts a ON a.id=COALESCE(pm.account_id, ba.account_id)
+		JOIN accounts a ON a.id=pm.account_id
 		WHERE r.id=$1`+suffix,
 		requestID,
 	).Scan(

@@ -240,8 +240,7 @@ func (s *EventStore) Confirm(ctx context.Context, event PaymentEvent, eventID in
 		       COALESCE(NULLIF(t.dex_offer_taken, '0001-01-01'::timestamptz), t.created_at)
 		FROM transactions t
 		JOIN payment_methods pm ON lower(pm.name)=lower(t.payment_method)
-		LEFT JOIN bank_accounts ba ON ba.id=pm.bank_account_id
-		JOIN accounts a ON a.id=COALESCE(pm.account_id, ba.account_id) AND a.is_active
+		JOIN accounts a ON a.id=pm.account_id AND a.is_active
 		WHERE t.id=$1 AND t.deleted_at IS NULL AND pm.is_active
 	`, txID).Scan(
 		&accountID, &provider, &channels, &status, &fiatAmount, &fiatCurrency,

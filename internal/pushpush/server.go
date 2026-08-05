@@ -340,8 +340,7 @@ func (s *Server) handleNotificationHealth(w http.ResponseWriter, r *http.Request
 	err := s.store.DB().QueryRowContext(r.Context(), `
 		SELECT a.provider, COALESCE(array_to_string(a.notification_channels::text[], ','), '')
 		FROM payment_methods pm
-		LEFT JOIN bank_accounts ba ON ba.id=pm.bank_account_id
-		JOIN accounts a ON a.id=COALESCE(pm.account_id, ba.account_id) AND a.is_active
+		JOIN accounts a ON a.id=pm.account_id AND a.is_active
 		WHERE lower(pm.name)=lower($1) AND pm.is_active
 	`, method).Scan(&provider, &channels)
 	if err != nil {

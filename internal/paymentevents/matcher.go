@@ -32,8 +32,8 @@ type Candidate struct {
 }
 
 // ListPending returns only bid transactions that still await fiat. Account
-// linkage works for both direct fiat-transmitter methods and bank-account
-// methods whose parent is an accounts row.
+// linkage resolves through payment_methods.account_id for both Fiat
+// Transmitter and Bank catalog methods.
 func (s *EventStore) ListPending(ctx context.Context) ([]Candidate, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT t.id, t.fiat_amount, t.fiat_currency, COALESCE(t.dex, ''),
@@ -43,8 +43,7 @@ func (s *EventStore) ListPending(ctx context.Context) ([]Candidate, error) {
 		       COALESCE(NULLIF(t.dex_offer_taken, '0001-01-01'::timestamptz), t.created_at)
 		FROM transactions t
 		LEFT JOIN payment_methods pm ON lower(pm.name)=lower(t.payment_method)
-		LEFT JOIN bank_accounts ba ON ba.id=pm.bank_account_id
-		LEFT JOIN accounts a ON a.id=COALESCE(pm.account_id, ba.account_id) AND a.is_active
+		LEFT JOIN accounts a ON a.id=pm.account_id AND a.is_active
 		WHERE t.status=$1 AND t.direction=$2 AND t.deleted_at IS NULL AND pm.is_active
 	`, statusDexPositionTaken, directionBUY)
 	if err != nil {
