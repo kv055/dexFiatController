@@ -1,5 +1,5 @@
 FROM golang:1.25-alpine AS builder
-ARG GOPROXY=https://goproxy.io,https://proxy.golang.org,direct
+ARG GOPROXY=https://goproxy.io,direct
 ENV GOPROXY=${GOPROXY}
 
 RUN apk add --no-cache git chromium
@@ -10,7 +10,9 @@ WORKDIR /build/dexFiatController
 # The build context is the repo root, so copy it to the parent of this module.
 COPY commons/ ../commons/
 COPY dexFiatController/go.mod dexFiatController/go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    sh -ec 'for attempt in 1 2 3 4 5; do go mod download && exit 0; echo "go mod download attempt $attempt failed, retrying..."; sleep $((attempt * 10)); done; exit 1'
 
 COPY dexFiatController/ .
 RUN CGO_ENABLED=0 go build -o /dexFiatController .
