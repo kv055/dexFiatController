@@ -19,10 +19,13 @@ RUN CGO_ENABLED=0 go build -o /dexFiatController .
 
 FROM alpine:3.21
 
-RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont zstd
+# Scraping (SCRAPING_ENABLED) is off by default; Chromium is only needed when
+# re-enabling browser automation for PayPal/Wise/Revolut connectors.
+# RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont zstd
+# ENV CHROME_PATH=/usr/bin/chromium-browser
+# ENV HEADLESS=true
+RUN apk add --no-cache ca-certificates wget
 
-ENV CHROME_PATH=/usr/bin/chromium-browser
-ENV HEADLESS=true
 ENV PUSHPUSH_ADDR=:8080
 
 # pushpush data dir (rules.json + notifications.jsonl persisted here).
