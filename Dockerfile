@@ -15,7 +15,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     sh -ec 'for attempt in 1 2 3 4 5; do go mod download && exit 0; echo "go mod download attempt $attempt failed, retrying..."; sleep $((attempt * 10)); done; exit 1'
 
 COPY dexFiatController/ .
-RUN CGO_ENABLED=0 go build -o /dexFiatController .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o /dexFiatController .
 
 FROM alpine:3.21
 
