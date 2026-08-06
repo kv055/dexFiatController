@@ -2,7 +2,7 @@ FROM golang:1.25-alpine AS builder
 ARG GOPROXY=https://goproxy.io,direct
 ENV GOPROXY=${GOPROXY}
 
-RUN apk add --no-cache git chromium
+RUN apk add --no-cache git
 
 WORKDIR /build/dexFiatController
 
@@ -17,9 +17,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 COPY dexFiatController/ .
 RUN CGO_ENABLED=0 go build -o /dexFiatController .
 
-FROM alpine:3.19
+FROM alpine:3.21
 
-RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont
+RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont zstd
 
 ENV CHROME_PATH=/usr/bin/chromium-browser
 ENV HEADLESS=true
