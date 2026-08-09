@@ -283,7 +283,7 @@ func listConfirmationStateTx(ctx context.Context, tx *sql.Tx, txID uint, account
 	rows, err := tx.QueryContext(ctx, `
 		SELECT c.channel, e.id, e.source, e.provider, e.account_id,
 		       e.source_event_id, COALESCE(e.sender, ''), COALESCE(e.amount_minor, 0),
-		       COALESCE(e.currency, ''), COALESCE(e.description, ''),
+		       COALESCE(e.currency::text, ''), COALESCE(e.description, ''),
 		       e.provider_timestamp, e.received_timestamp,
 		       COALESCE(e.audit_metadata, '{}'::jsonb), COALESCE(e.template_version, ''),
 		       COALESCE(e.authentication_outcome, ''), e.raw_message_hash
@@ -478,12 +478,12 @@ func loadPaymentConfirmationRequest(ctx context.Context, q rowQuerier, requestID
 		       r.decision_status, COALESCE(r.error, ''),
 		       e.id, e.source, e.provider, e.account_id, e.source_event_id,
 		       COALESCE(e.sender, ''), COALESCE(e.amount_minor, 0),
-		       COALESCE(e.currency, ''), COALESCE(e.description, ''),
+		       COALESCE(e.currency::text, ''), COALESCE(e.description, ''),
 		       e.provider_timestamp, e.received_timestamp,
 		       COALESCE(e.audit_metadata, '{}'::jsonb),
 		       COALESCE(e.template_version, ''), COALESCE(e.authentication_outcome, ''),
 		       e.raw_message_hash,
-		       t.id, t.fiat_amount, t.fiat_currency, COALESCE(t.dex, ''),
+		       t.id, t.fiat_amount, t.fiat_currency, COALESCE(t.dex::text, ''),
 		       COALESCE(t.payment_method, ''), a.id, a.provider,
 		       COALESCE(array_to_string(a.notification_channels::text[], ','), ''),
 		       COALESCE(NULLIF(t.dex_offer_taken, '0001-01-01'::timestamptz), t.created_at),

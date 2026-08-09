@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	directionBUY       = "BUY"
+	directionBUY       = "buy"
 	nameScoreThreshold = 0.6
 )
 
@@ -36,7 +36,7 @@ type Candidate struct {
 // Transmitter and Bank catalog methods.
 func (s *EventStore) ListPending(ctx context.Context) ([]Candidate, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT t.id, t.fiat_amount, t.fiat_currency, COALESCE(t.dex, ''),
+		SELECT t.id, t.fiat_amount, t.fiat_currency, COALESCE(t.dex::text, ''),
 		       t.counterparty_payment_info, COALESCE(t.payment_method, ''),
 		       COALESCE(a.id, 0), COALESCE(a.provider, ''),
 		       COALESCE(array_to_string(a.notification_channels::text[], ','), ''),

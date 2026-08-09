@@ -64,13 +64,13 @@ func EventIDFromBytes(raw []byte) string {
 const fiatPaymentEventsSchema = `
 CREATE TABLE IF NOT EXISTS fiat_payment_events (
     id BIGSERIAL PRIMARY KEY,
-    source VARCHAR(16) NOT NULL CHECK (source IN ('push', 'email')),
+    source notification_channel NOT NULL,
     provider TEXT NOT NULL,
     account_id BIGINT REFERENCES accounts(id) ON DELETE SET NULL,
     source_event_id TEXT NOT NULL,
     sender TEXT,
     amount_minor BIGINT,
-    currency CHAR(3),
+    currency fiat_currency,
     description TEXT,
     provider_timestamp TIMESTAMPTZ,
     received_timestamp TIMESTAMPTZ NOT NULL,
@@ -93,7 +93,7 @@ CREATE INDEX IF NOT EXISTS fiat_payment_events_match_idx
 CREATE TABLE IF NOT EXISTS fiat_transaction_confirmations (
     transaction_id BIGINT NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
     account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    channel VARCHAR(16) NOT NULL CHECK (channel IN ('push', 'email')),
+    channel notification_channel NOT NULL,
     payment_event_id BIGINT NOT NULL REFERENCES fiat_payment_events(id) ON DELETE RESTRICT,
     confirmed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (transaction_id, channel),
@@ -235,7 +235,7 @@ func (s *EventStore) Confirm(ctx context.Context, event PaymentEvent, eventID in
 	err = tx.QueryRowContext(ctx, `
 		SELECT a.id, a.provider,
 		       COALESCE(array_to_string(a.notification_channels::text[], ','), ''),
-		       t.status, t.fiat_amount, t.fiat_currency, COALESCE(t.dex, ''),
+		       t.status, t.fiat_amount, t.fiat_currency, COALESCE(t.dex::text, ''),
 		       COALESCE(t.payment_method, ''), t.counterparty_payment_info,
 		       COALESCE(NULLIF(t.dex_offer_taken, '0001-01-01'::timestamptz), t.created_at)
 		FROM transactions t

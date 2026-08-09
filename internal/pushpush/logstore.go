@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS fiat_tx_push_logs (
     raw JSONB,
     normalized TEXT,
     amount DOUBLE PRECISION,
-    currency CHAR(3),
+    currency fiat_currency,
     sender TEXT,
     status VARCHAR(40) NOT NULL,
     matched_tx_id BIGINT,
