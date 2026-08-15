@@ -87,7 +87,7 @@ func TestEventStoreChannelGateIntegration(t *testing.T) {
 	err = db.QueryRowContext(ctx, `
 		INSERT INTO transactions
 		    (direction, fiat_amount, fiat_currency, payment_method, status, transaction_complete)
-		VALUES ('buy', 12.34, 'EUR', $1, $2, FALSE)
+		VALUES ('bid', 12.34, 'EUR', $1, $2, FALSE)
 		RETURNING id
 	`, method, "DexPositionTaken").Scan(&transactionID)
 	if err != nil {

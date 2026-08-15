@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	directionBUY       = "buy"
+	directionBid       = "bid"
 	nameScoreThreshold = 0.6
 )
 
@@ -45,7 +45,7 @@ func (s *EventStore) ListPending(ctx context.Context) ([]Candidate, error) {
 		LEFT JOIN payment_methods pm ON lower(pm.name)=lower(t.payment_method)
 		LEFT JOIN accounts a ON a.id=pm.account_id AND a.is_active
 		WHERE t.status=$1 AND t.direction=$2 AND t.deleted_at IS NULL AND pm.is_active
-	`, statusDexPositionTaken, directionBUY)
+	`, statusDexPositionTaken, directionBid)
 	if err != nil {
 		return nil, fmt.Errorf("payment events: list pending fiat: %w", err)
 	}
