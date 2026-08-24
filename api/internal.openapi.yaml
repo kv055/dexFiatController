@@ -1,0 +1,148 @@
+openapi: 3.1.0
+info:
+  title: dexFiatController internal API
+  version: 1.0.0
+  description: Private service and operational contract. This handwritten specification is the source of truth.
+  contact:
+    name: dexArbTrading maintainers
+    url: https://github.com/kv055/dexArbTrading
+servers:
+  - url: http://localhost:8080
+tags:
+  - name: health
+  - name: notification-health
+  - name: phone-callback-history
+  - name: phone-heartbeat
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      tags:
+        - health
+      summary: GET /health
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        default:
+          description: Error response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+            text/plain:
+              schema:
+                type: string
+      description: GET /health
+      security: []
+  /notification-health:
+    get:
+      operationId: getNotificationHealth
+      tags:
+        - notification-health
+      summary: GET /notification-health
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        default:
+          description: Error response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+            text/plain:
+              schema:
+                type: string
+      description: GET /notification-health
+      security:
+        - webhookSecret: []
+  /phone-callback-history:
+    get:
+      operationId: getPhoneCallbackHistory
+      tags:
+        - phone-callback-history
+      summary: GET /phone-callback-history
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        default:
+          description: Error response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+            text/plain:
+              schema:
+                type: string
+      description: GET /phone-callback-history
+      security:
+        - webhookSecret: []
+  /phone-heartbeat:
+    get:
+      operationId: getPhoneHeartbeat
+      tags:
+        - phone-heartbeat
+      summary: GET /phone-heartbeat
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        default:
+          description: Error response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+            text/plain:
+              schema:
+                type: string
+      description: GET /phone-heartbeat
+      security:
+        - webhookSecret: []
+components:
+  securitySchemes:
+    dashboardSession:
+      type: apiKey
+      in: cookie
+      name: dex_session
+    internalSecret:
+      type: apiKey
+      in: header
+      name: X-Internal-Secret
+    webhookSecret:
+      type: apiKey
+      in: header
+      name: X-Webhook-Secret
+    bearerWebhook:
+      type: http
+      scheme: bearer
+    telegramSecret:
+      type: apiKey
+      in: header
+      name: X-Telegram-Bot-Api-Secret-Token
+  schemas:
+    APIError:
+      $ref: ../../commons/api/openapi/APIError.yaml
+    Health:
+      $ref: ../../commons/api/openapi/Health.yaml

@@ -17,6 +17,16 @@ func TestRegisterRoutes(t *testing.T) {
 		assertRoutePattern(t, mux, http.MethodGet, "/phone-heartbeat", "GET /phone-heartbeat")
 		assertRoutePattern(t, mux, http.MethodGet, "/phone-callback-history", "GET /phone-callback-history")
 		assertRoutePattern(t, mux, http.MethodGet, "/notification-health", "GET /notification-health")
+
+		req := httptest.NewRequest(http.MethodPost, "/telegram-webhook", nil)
+		recorder := httptest.NewRecorder()
+		mux.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("contentless webhook status = %d, want %d (body=%s)", recorder.Code, http.StatusUnauthorized, recorder.Body.String())
+		}
+		if recorder.Body.Len() != 0 {
+			t.Fatalf("contentless webhook body = %q, want empty", recorder.Body.String())
+		}
 	})
 
 	t.Run("capture", func(t *testing.T) {
