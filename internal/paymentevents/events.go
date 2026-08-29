@@ -357,7 +357,7 @@ func (s *EventStore) Confirm(ctx context.Context, event PaymentEvent, eventID in
 	}
 	res, err := tx.ExecContext(ctx, `
 		UPDATE transactions
-		SET status=$1, dex_fiat_arrival=$2, updated_at=CURRENT_TIMESTAMP
+		SET status=$1, status_reason=NULL, dex_fiat_arrival=$2, updated_at=CURRENT_TIMESTAMP
 		WHERE id=$3 AND status=$4 AND deleted_at IS NULL
 	`, statusDexFiatHasArrived, []byte(evidence), txID, statusDexPositionTaken)
 	if err != nil {
