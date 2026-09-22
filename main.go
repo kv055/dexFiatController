@@ -110,9 +110,7 @@ func loadScrapingConfig() (scrapingcontroller.Config, func()) {
 		pollInterval = 30 * time.Second
 	}
 
-	cleanup := func() {
-		// no secrets DB opened; nothing to close
-	}
+	var cleanup func()
 
 	browserCfg := scrapingbrowser.DefaultConfig()
 	browserCfg.Headless = envOr("HEADLESS", "true") == "true"

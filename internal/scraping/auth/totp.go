@@ -29,10 +29,6 @@ type totpRegisterRequest struct {
 	Secret  string `json:"secret"`
 }
 
-type totpRegisterResponse struct {
-	Status string `json:"status"`
-}
-
 type totpCodeResponse struct {
 	Service   string `json:"service"`
 	Code      string `json:"code"`
@@ -42,10 +38,6 @@ type totpCodeResponse struct {
 
 type totpListResponse struct {
 	Services []string `json:"services"`
-}
-
-type totpErrorResponse struct {
-	Error string `json:"error"`
 }
 
 func (c *TOTPClient) Register(ctx context.Context, service, secret string) error {
