@@ -60,7 +60,7 @@ func (c *TOTPClient) Register(ctx context.Context, service, secret string) error
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return fmt.Errorf("auth/totp: register failed (%d): %s", resp.StatusCode, string(raw))
 	}
 
@@ -81,7 +81,7 @@ func (c *TOTPClient) GenerateCode(ctx context.Context, service string) (string, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return "", 0, fmt.Errorf("auth/totp: code failed (%d): %s", resp.StatusCode, string(raw))
 	}
 

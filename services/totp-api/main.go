@@ -117,7 +117,7 @@ func (s *Service) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req RegisterRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
@@ -145,7 +145,7 @@ func (s *Service) handleCode(w http.ResponseWriter, r *http.Request) {
 	var req CodeRequest
 
 	if r.Method == http.MethodPost {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
 			jsonError(w, http.StatusBadRequest, "invalid json")
 			return
 		}

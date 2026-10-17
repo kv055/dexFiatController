@@ -82,7 +82,7 @@ func (r *ReleaseClient) doOnce(ctx context.Context, body []byte) error {
 		return fmt.Errorf("send release request: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	switch {
 	case resp.StatusCode == http.StatusOK, resp.StatusCode == http.StatusAccepted:

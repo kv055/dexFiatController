@@ -26,6 +26,24 @@ import (
 	"dexFiatController/internal/paymentingestion"
 )
 
+// maxJSONBodyBytes bounds request bodies so a client cannot stream an
+// unbounded body into the JSON decoders (generated handlers included).
+const maxJSONBodyBytes = 1 << 20 // 1 MiB
+
+// limitRequestBody caps the body of state-changing requests. Handlers that
+// need a stricter limit apply their own MaxBytesReader on top.
+func limitRequestBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost, http.MethodPut, http.MethodPatch:
+			if r.Body != nil {
+				r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // Server is the PushPush HTTP transport and Telegram presentation adapter.
 type Server struct {
 	cfg       Config
@@ -181,7 +199,7 @@ func (s *Server) Run(ctx context.Context) error {
 		}()
 	}
 
-	var handler http.Handler = mux
+	var handler http.Handler = limitRequestBody(mux)
 	if s.metrics != nil {
 		mux.Handle("GET /metrics", s.metrics.Handler())
 		handler = s.metrics.Middleware(handler)
@@ -625,7 +643,7 @@ func (s *Server) handleTelegramWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var u telegram.Update
-	if err := json.NewDecoder(r.Body).Decode(&u); err != nil || u.CallbackQuery == nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)).Decode(&u); err != nil || u.CallbackQuery == nil {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
