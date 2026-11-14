@@ -81,7 +81,7 @@ func seedTelegramFromDB(ctx context.Context, db *sql.DB, fallback telegram.Confi
 // config_version changes and applies them to the pushpush TelegramClient at
 // runtime: it rebuilds the inner *telegram.Client and re-registers the PUSHPUSH
 // webhook with Telegram when one is configured. This is the hot-reload path that
-// lets the dexMmController UI update the shared bot credentials without a
+// lets the dexTakerController UI update the shared bot credentials without a
 // pushpush restart.
 func runTelegramSettingsPoller(ctx context.Context, db *sql.DB, tg *TelegramClient, httpClient *http.Client, lastVersion int64) {
 	if db == nil || tg == nil {

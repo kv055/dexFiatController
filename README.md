@@ -1,6 +1,6 @@
 # dexFiatController
 
-`dexFiatController` is the fiat automation service for dexArbTrading. It monitors fiat-provider accounts, handles multi-factor authentication, and forwards observed payment events to `dexUnifiedApi`.
+`dexFiatController` is the fiat automation service for dexPendulum. It monitors fiat-provider accounts, handles multi-factor authentication, and forwards observed payment events to `dexUnifiedApi`.
 
 The controller currently targets PayPal, Wise, and Revolut through browser automation. Credentials and account secrets are read from the shared Postgres database rather than from environment variables.
 

@@ -29,7 +29,7 @@ type Config struct {
 	// uses).
 	DatabaseURL string
 
-	// ReleaseURL is the dexMmController dex-release webhook.
+	// ReleaseURL is the dexTakerController dex-release webhook.
 	ReleaseURL   string
 	ReleaseToken string
 

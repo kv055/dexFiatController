@@ -15,7 +15,7 @@ import (
 // TelegramClient sends escalation messages via the shared commons/telegram client.
 // The inner *telegram.Client is mutable at runtime via SetClient so pushpush
 // picks up hot-reloaded bot credentials (written to the shared telegram_settings
-// row by the dexMmController UI) without a restart.
+// row by the dexTakerController UI) without a restart.
 type TelegramClient struct {
 	mu    sync.RWMutex
 	inner *telegram.Client
