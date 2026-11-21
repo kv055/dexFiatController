@@ -30,12 +30,20 @@ RUN apk add --no-cache ca-certificates wget
 
 ENV PUSHPUSH_ADDR=:8080
 
+# Unprivileged runtime user with a fixed UID, so volume ownership is stable
+# across rebuilds. A fresh named volume inherits /data's ownership from the
+# image; volumes created by older root-run images are fixed by the
+# fiat-controller-data-init service in docker-compose.yml.
+RUN addgroup -S -g 10001 app && adduser -S -D -H -u 10001 -G app app
+
 # pushpush data dir (rules.json + notifications.jsonl persisted here).
-RUN mkdir -p /data
+RUN mkdir -p /data && chown 10001:10001 /data
 VOLUME ["/data"]
 
 EXPOSE 8080
 
 COPY --from=builder /dexFiatController /usr/local/bin/dexFiatController
+
+USER 10001:10001
 
 ENTRYPOINT ["dexFiatController"]
