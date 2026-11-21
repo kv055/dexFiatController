@@ -13,7 +13,7 @@ require (
 	github.com/oapi-codegen/runtime v1.9.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/sashabaranov/go-openai v1.32.5
-	golang.org/x/net v0.62.0
+	golang.org/x/net v0.63.0
 )
 
 replace commons => ../commons
