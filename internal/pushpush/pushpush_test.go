@@ -195,8 +195,8 @@ func TestExtractJSONObject(t *testing.T) {
 	}{
 		{
 			name:  "clean json",
-			input: `{"app":"Revolut","title":"You received €1","text":"Payment received from Kilian Reimar Joergen Voss. Tap for details","time":"1783110191"}`,
-			want:  `{"app":"Revolut","title":"You received €1","text":"Payment received from Kilian Reimar Joergen Voss. Tap for details","time":"1783110191"}`,
+			input: `{"app":"Revolut","title":"You received €1","text":"Payment received from Erika Anna Maria Mustermann. Tap for details","time":"1783110191"}`,
+			want:  `{"app":"Revolut","title":"You received €1","text":"Payment received from Erika Anna Maria Mustermann. Tap for details","time":"1783110191"}`,
 			ok:    true,
 		},
 		{
@@ -207,19 +207,19 @@ func TestExtractJSONObject(t *testing.T) {
 		},
 		{
 			name:  "prefix junk before json",
-			input: "Kilian Voss has received your bank transfer of €1\n\n" + `{"app":"N26","title":"N26","text":"Kilian Voss has received your bank transfer of €1","time":"1783110200"}`,
-			want:  `{"app":"N26","title":"N26","text":"Kilian Voss has received your bank transfer of €1","time":"1783110200"}`,
+			input: "Erika Mustermann has received your bank transfer of €1\n\n" + `{"app":"N26","title":"N26","text":"Erika Mustermann has received your bank transfer of €1","time":"1783110200"}`,
+			want:  `{"app":"N26","title":"N26","text":"Erika Mustermann has received your bank transfer of €1","time":"1783110200"}`,
 			ok:    true,
 		},
 		{
 			name:  "braces inside string literals",
-			input: `{"app":"N26","title":"N26","text":"You received €2 {promo} from Kilian Voss.","time":"1783110450"}`,
-			want:  `{"app":"N26","title":"N26","text":"You received €2 {promo} from Kilian Voss.","time":"1783110450"}`,
+			input: `{"app":"N26","title":"N26","text":"You received €2 {promo} from Erika Mustermann.","time":"1783110450"}`,
+			want:  `{"app":"N26","title":"N26","text":"You received €2 {promo} from Erika Mustermann.","time":"1783110450"}`,
 			ok:    true,
 		},
 		{
 			name:  "invalid json typo falls back",
-			input: `{"app":"Revolut","title":"Transfer sent ✅","text":"You sent €2 to Kilian Reimar Joergen Voss.","date":"time":"1783110442"}`,
+			input: `{"app":"Revolut","title":"Transfer sent ✅","text":"You sent €2 to Erika Anna Maria Mustermann.","date":"time":"1783110442"}`,
 			ok:    false,
 		},
 		{
@@ -255,30 +255,30 @@ func TestCapturedShapesParse(t *testing.T) {
 	}{
 		{
 			name:     "revolut received",
-			body:     `{"app":"Revolut","title":"You received €1","text":"Payment received from Kilian Reimar Joergen Voss. Tap for details","time":"1783110191"}`,
+			body:     `{"app":"Revolut","title":"You received €1","text":"Payment received from Erika Anna Maria Mustermann. Tap for details","time":"1783110191"}`,
 			app:      "Revolut",
 			amount:   1,
 			currency: "EUR",
-			sender:   "Kilian Reimar Joergen Voss",
+			sender:   "Erika Anna Maria Mustermann",
 		},
 		{
 			name:     "n26 received with sender",
-			body:     `{"app":"N26","title":"N26","text":"You received €2 from Kilian Voss.","time":"1783110450"}`,
+			body:     `{"app":"N26","title":"N26","text":"You received €2 from Erika Mustermann.","time":"1783110450"}`,
 			app:      "N26",
 			amount:   2,
 			currency: "EUR",
-			sender:   "Kilian Voss",
+			sender:   "Erika Mustermann",
 		},
 		{
 			name:     "n26 received without sender in text",
-			body:     `{"app":"N26","title":"N26","text":"Kilian Voss has received your bank transfer of €1","time":"1783110200"}`,
+			body:     `{"app":"N26","title":"N26","text":"Erika Mustermann has received your bank transfer of €1","time":"1783110200"}`,
 			app:      "N26",
 			amount:   1,
 			currency: "EUR",
 			// This N26 notification type names the receiver (the user), not the
 			// sender; the regex still extracts the name, but it is not a real
 			// counterparty sender — matching relies on amount+currency instead.
-			sender: "Kilian Voss",
+			sender: "Erika Mustermann",
 		},
 	}
 	for _, c := range cases {
@@ -309,7 +309,7 @@ func TestCapturedShapesParse(t *testing.T) {
 // Content-Type. The whole body becomes the notification text and amount /
 // sender must be mined from it via parseAmount and parseSenderName.
 //
-// Plain text is best-effort: when digits are glued to a name (e.g. "€1Kilian")
+// Plain text is best-effort: when digits are glued to a name (e.g. "€1Erika")
 // the word-boundary name regex cannot recover the sender, so such notifications
 // fall back to amount+currency matching and escalate to Telegram when
 // ambiguous. Structured JSON avoids this entirely.
@@ -324,15 +324,15 @@ func TestPlainTextNotificationParsing(t *testing.T) {
 	}{
 		{
 			name:        "revolut style",
-			body:        "You received €1Payment received from Kilian Reimar Joergen Voss. Tap for details",
+			body:        "You received €1Payment received from Erika Anna Maria Mustermann. Tap for details",
 			amount:      1,
 			currency:    "EUR",
-			sender:      "Kilian Reimar Joergen Voss",
+			sender:      "Erika Anna Maria Mustermann",
 			senderExact: true,
 		},
 		{
 			name:        "n26 style names receiver not sender",
-			body:        "N26Kilian Voss has received your bank transfer of €1Kilian Voss has received your bank transfer of €1",
+			body:        "N26Erika Mustermann has received your bank transfer of €1Erika Mustermann has received your bank transfer of €1",
 			amount:      1,
 			currency:    "EUR",
 			sender:      "",
