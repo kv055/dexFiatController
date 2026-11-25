@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
 	"github.com/sashabaranov/go-openai"
 )
@@ -104,42 +103,52 @@ func NewStagehand(service string, cfg StagehandConfig, registry *SelectorRegistr
 
 func (s *Stagehand) Click(ctx context.Context, selectorKey string) error {
 	return s.executeWithHealing(ctx, selectorKey, func(sel string) error {
-		return chromedp.Click(sel, chromedp.ByQuery).Do(ctx)
+		return chromedp.Do(ctx, chromedp.Click(chromedp.CSS(sel)))
 	})
 }
 
 func (s *Stagehand) SendKeys(ctx context.Context, selectorKey, value string) error {
 	return s.executeWithHealing(ctx, selectorKey, func(sel string) error {
-		return chromedp.SendKeys(sel, value, chromedp.ByQuery).Do(ctx)
+		return chromedp.Do(ctx, chromedp.SendKeys(chromedp.CSS(sel), value))
 	})
 }
 
 func (s *Stagehand) GetValue(ctx context.Context, selectorKey string, result *string) error {
 	return s.executeWithHealing(ctx, selectorKey, func(sel string) error {
-		return chromedp.Value(sel, result, chromedp.ByQuery).Do(ctx)
+		v, err := chromedp.Run(ctx, chromedp.Value(chromedp.CSS(sel)))
+		if err != nil {
+			return err
+		}
+		*result = v
+		return nil
 	})
 }
 
 func (s *Stagehand) GetText(ctx context.Context, selectorKey string, result *string) error {
 	return s.executeWithHealing(ctx, selectorKey, func(sel string) error {
-		return chromedp.Text(sel, result, chromedp.ByQuery).Do(ctx)
+		v, err := chromedp.Run(ctx, chromedp.Text(chromedp.CSS(sel)))
+		if err != nil {
+			return err
+		}
+		*result = v
+		return nil
 	})
 }
 
 func (s *Stagehand) WaitVisible(ctx context.Context, selectorKey string, opts ...chromedp.QueryOption) error {
 	return s.executeWithHealing(ctx, selectorKey, func(sel string) error {
-		return chromedp.WaitVisible(sel, chromedp.ByQuery).Do(ctx)
+		return chromedp.Do(ctx, chromedp.WaitVisible(chromedp.CSS(sel)))
 	})
 }
 
 func (s *Stagehand) WaitReady(ctx context.Context, selectorKey string) error {
 	return s.executeWithHealing(ctx, selectorKey, func(sel string) error {
-		return chromedp.WaitReady(sel, chromedp.ByQuery).Do(ctx)
+		return chromedp.Do(ctx, chromedp.WaitReady(chromedp.CSS(sel)))
 	})
 }
 
 func (s *Stagehand) Navigate(ctx context.Context, url string) error {
-	return chromedp.Navigate(url).Do(ctx)
+	return chromedp.Do(ctx, chromedp.Navigate(url))
 }
 
 func (s *Stagehand) Exists(ctx context.Context, selectorKey string) (bool, error) {
@@ -152,8 +161,8 @@ func (s *Stagehand) Exists(ctx context.Context, selectorKey string) (bool, error
 	selectors = append(selectors, entry.FallbackChain...)
 
 	for _, sel := range selectors {
-		var nodes []*cdp.Node
-		if err := chromedp.Nodes(sel, &nodes, chromedp.ByQueryAll).Do(ctx); err != nil {
+		nodes, err := chromedp.Run(ctx, chromedp.Nodes(chromedp.CSSAll(sel)))
+		if err != nil {
 			continue
 		}
 		if len(nodes) > 0 {
@@ -174,15 +183,15 @@ func (s *Stagehand) MaybeClick(ctx context.Context, selectorKey string) (bool, e
 	selectors = append(selectors, entry.FallbackChain...)
 
 	for i, sel := range selectors {
-		var nodes []*cdp.Node
-		if err := chromedp.Nodes(sel, &nodes, chromedp.ByQueryAll).Do(ctx); err != nil {
+		nodes, err := chromedp.Run(ctx, chromedp.Nodes(chromedp.CSSAll(sel)))
+		if err != nil {
 			continue
 		}
 		if len(nodes) == 0 {
 			continue
 		}
 
-		if err := chromedp.Click(sel, chromedp.ByQuery).Do(ctx); err != nil {
+		if err := chromedp.Do(ctx, chromedp.Click(chromedp.CSS(sel))); err != nil {
 			return false, err
 		}
 		if i > 0 {
@@ -194,13 +203,8 @@ func (s *Stagehand) MaybeClick(ctx context.Context, selectorKey string) (bool, e
 	return false, nil
 }
 
-func (s *Stagehand) Execute(ctx context.Context, actions ...chromedp.Action) error {
-	for _, a := range actions {
-		if err := a.Do(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
+func (s *Stagehand) Execute(ctx context.Context, actions ...chromedp.Action[chromedp.Void]) error {
+	return chromedp.Do(ctx, actions...)
 }
 
 func (s *Stagehand) executeWithHealing(ctx context.Context, selectorKey string, fn func(string) error) error {
@@ -245,9 +249,8 @@ func (s *Stagehand) healSelector(ctx context.Context, key string, entry *Selecto
 	healCtx, cancel := context.WithTimeout(ctx, s.cfg.HealTimeout)
 	defer cancel()
 
-	var domSnapshot string
-	if err := chromedp.Run(healCtx,
-		chromedp.Evaluate(`
+	domSnapshot, err := chromedp.Run(healCtx,
+		chromedp.Evaluate[string](`
 			(() => {
 				const snapshot = [];
 				function walk(el, depth) {
@@ -266,8 +269,9 @@ func (s *Stagehand) healSelector(ctx context.Context, key string, entry *Selecto
 				walk(document.body, 0);
 				return snapshot.join('\n');
 			})()
-		`, &domSnapshot),
-	); err != nil {
+		`),
+	)
+	if err != nil {
 		return false, "", fmt.Errorf("capture DOM snapshot: %w", err)
 	}
 

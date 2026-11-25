@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/webauthn"
 	"github.com/chromedp/chromedp"
 )
@@ -72,11 +74,11 @@ func (pm *PasskeyManager) Enable(ctx context.Context) error {
 		return nil
 	}
 
-	if err := webauthn.Enable().Do(ctx); err != nil {
+	if _, err := chromedp.Call(ctx, webauthn.Enable, webauthn.EnableParams{}); err != nil {
 		return fmt.Errorf("auth/passkey: enable webauthn domain: %w", err)
 	}
 
-	authID, err := webauthn.AddVirtualAuthenticator(&webauthn.VirtualAuthenticatorOptions{
+	added, err := chromedp.Call(ctx, webauthn.AddVirtualAuthenticator, webauthn.AddVirtualAuthenticatorParams{Options: &webauthn.VirtualAuthenticatorOptions{
 		Protocol:                    webauthn.AuthenticatorProtocolCtap2,
 		Ctap2version:                webauthn.Ctap2versionCtap21,
 		Transport:                   webauthn.AuthenticatorTransportInternal,
@@ -86,31 +88,24 @@ func (pm *PasskeyManager) Enable(ctx context.Context) error {
 		AutomaticPresenceSimulation: true,
 		DefaultBackupEligibility:    true,
 		DefaultBackupState:          true,
-	}).Do(ctx)
+	}})
 	if err != nil {
 		return fmt.Errorf("auth/passkey: add virtual authenticator: %w", err)
 	}
+	authID := added.AuthenticatorID
 
 	pm.authenticators[cid] = authID
 
 	for rpID, creds := range pm.credentials {
 		for _, cred := range creds {
-			privKeyBytes, err := x509.MarshalPKCS8PrivateKey(cred.PrivateKey)
+			cdpCred, err := encodeCDPCredential(cred, rpID)
 			if err != nil {
+				log.Printf("[passkey] skip stored credential for rpID=%s: marshal private key: %v", rpID, err)
 				continue
 			}
-			privKeyPEM := base64.StdEncoding.EncodeToString(privKeyBytes)
-			credID := base64.StdEncoding.EncodeToString(cred.CredentialID)
-			userHandle := base64.StdEncoding.EncodeToString(cred.UserHandle)
-
-			_ = webauthn.AddCredential(authID, &webauthn.Credential{
-				CredentialID:         credID,
-				IsResidentCredential: true,
-				RpID:                 rpID,
-				PrivateKey:           privKeyPEM,
-				UserHandle:           userHandle,
-				SignCount:            cred.SignCount,
-			}).Do(ctx)
+			if err := addToAuthenticator(ctx, authID, cdpCred); err != nil {
+				log.Printf("[passkey] load stored credential for rpID=%s: %v", rpID, err)
+			}
 		}
 	}
 
@@ -128,11 +123,11 @@ func (pm *PasskeyManager) Disable(ctx context.Context) error {
 		return nil
 	}
 
-	if err := webauthn.RemoveVirtualAuthenticator(authID).Do(ctx); err != nil {
+	if _, err := chromedp.Call(ctx, webauthn.RemoveVirtualAuthenticator, webauthn.RemoveVirtualAuthenticatorParams{AuthenticatorID: authID}); err != nil {
 		return fmt.Errorf("auth/passkey: remove virtual authenticator: %w", err)
 	}
 
-	if err := webauthn.Disable().Do(ctx); err != nil {
+	if _, err := chromedp.Call(ctx, webauthn.Disable, cdp.Empty{}); err != nil {
 		return fmt.Errorf("auth/passkey: disable webauthn domain: %w", err)
 	}
 
@@ -151,7 +146,11 @@ func (pm *PasskeyManager) SetUserVerified(ctx context.Context, verified bool) er
 		return fmt.Errorf("auth/passkey: no authenticator for context %s - call Enable() first", cid)
 	}
 
-	return webauthn.SetUserVerified(authID, verified).Do(ctx)
+	_, err := chromedp.Call(ctx, webauthn.SetUserVerified, webauthn.SetUserVerifiedParams{
+		AuthenticatorID: authID,
+		IsUserVerified:  verified,
+	})
+	return err
 }
 
 func (pm *PasskeyManager) AddCredential(ctx context.Context, cred *PasskeyCredential) error {
@@ -164,23 +163,12 @@ func (pm *PasskeyManager) AddCredential(ctx context.Context, cred *PasskeyCreden
 		return fmt.Errorf("auth/passkey: no authenticator for context %s - call Enable() first", cid)
 	}
 
-	privKeyBytes, err := x509.MarshalPKCS8PrivateKey(cred.PrivateKey)
+	cdpCred, err := encodeCDPCredential(cred, cred.RPID)
 	if err != nil {
 		return fmt.Errorf("auth/passkey: marshal private key: %w", err)
 	}
 
-	privKeyPEM := base64.StdEncoding.EncodeToString(privKeyBytes)
-	credID := base64.StdEncoding.EncodeToString(cred.CredentialID)
-	userHandle := base64.StdEncoding.EncodeToString(cred.UserHandle)
-
-	if err := webauthn.AddCredential(authID, &webauthn.Credential{
-		CredentialID:         credID,
-		IsResidentCredential: true,
-		RpID:                 cred.RPID,
-		PrivateKey:           privKeyPEM,
-		UserHandle:           userHandle,
-		SignCount:            cred.SignCount,
-	}).Do(ctx); err != nil {
+	if err := addToAuthenticator(ctx, authID, cdpCred); err != nil {
 		return fmt.Errorf("auth/passkey: add credential: %w", err)
 	}
 
@@ -207,9 +195,15 @@ func (pm *PasskeyManager) GetCredentials(ctx context.Context) ([]*webauthn.Crede
 		return nil, fmt.Errorf("auth/passkey: no authenticator for context %s", cid)
 	}
 
-	return webauthn.GetCredentials(authID).Do(ctx)
+	res, err := chromedp.Call(ctx, webauthn.GetCredentials, webauthn.GetCredentialsParams{AuthenticatorID: authID})
+	if err != nil {
+		return nil, err
+	}
+	return res.Credentials, nil
 }
 
+// RemoveCredential removes the credential whose ID, base64 (std) encoded, is
+// credentialID.
 func (pm *PasskeyManager) RemoveCredential(ctx context.Context, credentialID string) error {
 	pm.mu.Lock()
 	cid := contextID(ctx)
@@ -220,13 +214,20 @@ func (pm *PasskeyManager) RemoveCredential(ctx context.Context, credentialID str
 		return fmt.Errorf("auth/passkey: no authenticator for context %s", cid)
 	}
 
-	if err := webauthn.RemoveCredential(authID, credentialID).Do(ctx); err != nil {
+	rawID, err := base64.StdEncoding.DecodeString(credentialID)
+	if err != nil {
+		return fmt.Errorf("auth/passkey: decode credential id: %w", err)
+	}
+	if _, err := chromedp.Call(ctx, webauthn.RemoveCredential, webauthn.RemoveCredentialParams{
+		AuthenticatorID: authID,
+		CredentialID:    rawID,
+	}); err != nil {
 		return err
 	}
 
 	pm.mu.Lock()
 	removed := pm.removeCredentialLocked(credentialID)
-	err := pm.persistLocked()
+	err = pm.persistLocked()
 	pm.mu.Unlock()
 	if err != nil {
 		return err
@@ -248,7 +249,7 @@ func (pm *PasskeyManager) ClearCredentials(ctx context.Context) error {
 		return fmt.Errorf("auth/passkey: no authenticator for context %s", cid)
 	}
 
-	if err := webauthn.ClearCredentials(authID).Do(ctx); err != nil {
+	if _, err := chromedp.Call(ctx, webauthn.ClearCredentials, webauthn.ClearCredentialsParams{AuthenticatorID: authID}); err != nil {
 		return err
 	}
 
@@ -345,8 +346,8 @@ func HandlePasskeyAuthentication(ctx context.Context, pm *PasskeyManager) error 
 	return pm.SetUserVerified(ctx, true)
 }
 
-func WaitForPasskeyDialog(ctx context.Context, timeoutMs int) chromedp.Action {
-	return chromedp.WaitReady("body", chromedp.ByQuery)
+func WaitForPasskeyDialog(ctx context.Context, timeoutMs int) chromedp.Action[chromedp.Void] {
+	return chromedp.WaitReady(chromedp.CSS("body"))
 }
 
 func RegisterPasskey(ctx context.Context, pm *PasskeyManager, trigger func() error) (bool, error) {
@@ -416,10 +417,11 @@ func (pm *PasskeyManager) SyncCredentialsFromAuthenticator(ctx context.Context) 
 		return 0, fmt.Errorf("auth/passkey: no authenticator for context %s", cid)
 	}
 
-	credentials, err := webauthn.GetCredentials(authID).Do(ctx)
+	res, err := chromedp.Call(ctx, webauthn.GetCredentials, webauthn.GetCredentialsParams{AuthenticatorID: authID})
 	if err != nil {
 		return 0, fmt.Errorf("auth/passkey: get credentials: %w", err)
 	}
+	credentials := res.Credentials
 
 	pm.mu.Lock()
 	added := 0
@@ -428,13 +430,13 @@ func (pm *PasskeyManager) SyncCredentialsFromAuthenticator(ctx context.Context) 
 		passkeyCred, err := decodeCDPCredential(cred)
 		if err != nil {
 			pm.mu.Unlock()
-			return 0, fmt.Errorf("auth/passkey: decode credential %s: %w", cred.CredentialID, err)
+			return 0, fmt.Errorf("auth/passkey: decode credential %s: %w", base64.StdEncoding.EncodeToString(cred.CredentialID), err)
 		}
 
 		rpCreds := pm.credentials[passkeyCred.RPID]
 		matched := false
 		for _, existing := range rpCreds {
-			if base64.StdEncoding.EncodeToString(existing.CredentialID) == cred.CredentialID {
+			if bytes.Equal(existing.CredentialID, cred.CredentialID) {
 				existing.PrivateKey = passkeyCred.PrivateKey
 				existing.UserHandle = passkeyCred.UserHandle
 				existing.SignCount = passkeyCred.SignCount
@@ -474,18 +476,63 @@ func (pm *PasskeyManager) persistLocked() error {
 	return pm.store.SaveCredentials(context.Background(), pm.snapshotCredentialsLocked())
 }
 
+// addCredentialParams is webauthn.AddCredentialParams with a credential that
+// sends only the fields this package sets. cdproto v0.160 always sends
+// generateCmtgKeyOnNextOperation, backupEligibility and backupState. Chrome's
+// virtual authenticator rejects a credential with any CMTG field ("CMTG is not
+// supported by this authenticator"), and explicit backup flags would override
+// the authenticator defaults that Enable sets.
+type addCredentialParams struct {
+	AuthenticatorID webauthn.AuthenticatorID `json:"authenticatorId"`
+	Credential      addCredentialBody        `json:"credential"`
+}
+
+type addCredentialBody struct {
+	CredentialID         []byte  `json:"credentialId"`
+	IsResidentCredential bool    `json:"isResidentCredential"`
+	RpID                 string  `json:"rpId,omitzero"`
+	PrivateKey           []byte  `json:"privateKey"`
+	UserHandle           []byte  `json:"userHandle,omitzero"`
+	SignCount            float64 `json:"signCount"`
+}
+
+var addCredentialCommand = cdp.Command[addCredentialParams, cdp.Empty]{Method: webauthn.CommandAddCredential}
+
+func addToAuthenticator(ctx context.Context, authID webauthn.AuthenticatorID, c *webauthn.Credential) error {
+	_, err := chromedp.Call(ctx, addCredentialCommand, addCredentialParams{
+		AuthenticatorID: authID,
+		Credential: addCredentialBody{
+			CredentialID:         c.CredentialID,
+			IsResidentCredential: c.IsResidentCredential,
+			RpID:                 c.RpID,
+			PrivateKey:           c.PrivateKey,
+			UserHandle:           c.UserHandle,
+			SignCount:            c.SignCount,
+		},
+	})
+	return err
+}
+
+// encodeCDPCredential builds the protocol credential for cred. The protocol
+// carries the ID, the PKCS#8 key and the user handle as raw bytes (base64 on
+// the wire, encoded by cdproto).
+func encodeCDPCredential(cred *PasskeyCredential, rpID string) (*webauthn.Credential, error) {
+	privKeyBytes, err := x509.MarshalPKCS8PrivateKey(cred.PrivateKey)
+	if err != nil {
+		return nil, err
+	}
+	return &webauthn.Credential{
+		CredentialID:         append([]byte(nil), cred.CredentialID...),
+		IsResidentCredential: true,
+		RpID:                 rpID,
+		PrivateKey:           privKeyBytes,
+		UserHandle:           append([]byte(nil), cred.UserHandle...),
+		SignCount:            float64(cred.SignCount),
+	}, nil
+}
+
 func decodeCDPCredential(cred *webauthn.Credential) (*PasskeyCredential, error) {
-	credID, err := base64.StdEncoding.DecodeString(cred.CredentialID)
-	if err != nil {
-		return nil, fmt.Errorf("decode credential id: %w", err)
-	}
-
-	privKeyBytes, err := base64.StdEncoding.DecodeString(cred.PrivateKey)
-	if err != nil {
-		return nil, fmt.Errorf("decode private key: %w", err)
-	}
-
-	parsedKey, err := x509.ParsePKCS8PrivateKey(privKeyBytes)
+	parsedKey, err := x509.ParsePKCS8PrivateKey(cred.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("parse private key: %w", err)
 	}
@@ -495,17 +542,12 @@ func decodeCDPCredential(cred *webauthn.Credential) (*PasskeyCredential, error) 
 		return nil, fmt.Errorf("unexpected private key type %T", parsedKey)
 	}
 
-	userHandle, err := base64.StdEncoding.DecodeString(cred.UserHandle)
-	if err != nil {
-		return nil, fmt.Errorf("decode user handle: %w", err)
-	}
-
 	return &PasskeyCredential{
-		CredentialID: credID,
+		CredentialID: append([]byte(nil), cred.CredentialID...),
 		PrivateKey:   privateKey,
 		RPID:         cred.RpID,
-		UserHandle:   userHandle,
-		SignCount:    cred.SignCount,
+		UserHandle:   append([]byte(nil), cred.UserHandle...),
+		SignCount:    int64(cred.SignCount),
 	}, nil
 }
 
