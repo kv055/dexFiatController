@@ -10,7 +10,7 @@ require (
 	github.com/emersion/go-message v0.18.2
 	github.com/getkin/kin-openapi v0.147.0
 	github.com/jackc/pgx/v5 v5.9.2
-	github.com/oapi-codegen/runtime v1.9.0
+	github.com/oapi-codegen/runtime v1.9.1
 	github.com/prometheus/client_golang v1.25.0
 	github.com/sashabaranov/go-openai v1.32.5
 	golang.org/x/net v0.63.0
