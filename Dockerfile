@@ -1,4 +1,4 @@
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 ARG GOPROXY=https://proxy.golang.org|https://goproxy.io|direct
 ENV GOPROXY=${GOPROXY}
 
@@ -19,7 +19,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -o /dexFiatController .
 
-FROM alpine:3.21
+FROM alpine:3.24
 
 # Scraping (SCRAPING_ENABLED) is off by default; Chromium is only needed when
 # re-enabling browser automation for PayPal/Wise/Revolut connectors.
