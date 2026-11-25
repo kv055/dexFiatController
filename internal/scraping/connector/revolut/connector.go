@@ -121,7 +121,7 @@ func (c *Connector) Login(ctx context.Context) error {
 
 func (c *Connector) requires2FA(ctx context.Context) bool {
 	var pageTitle string
-	if err := chromedp.Title(&pageTitle).Do(ctx); err != nil {
+	if err := browser.RunInto(ctx, chromedp.Title(), &pageTitle); err != nil {
 		return false
 	}
 	lower := strings.ToLower(pageTitle)
@@ -205,7 +205,7 @@ func (c *Connector) submit2FACode(ctx context.Context, code string) error {
 
 func (c *Connector) checkLoginSuccess(ctx context.Context) (bool, error) {
 	var currentURL string
-	if err := chromedp.Location(&currentURL).Do(ctx); err != nil {
+	if err := browser.RunInto(ctx, chromedp.Location(), &currentURL); err != nil {
 		return false, err
 	}
 	return !strings.Contains(currentURL, "login") &&
@@ -255,7 +255,7 @@ func (c *Connector) maybeRegisterPasskey(ctx context.Context) error {
 
 func currentHost(ctx context.Context) (string, error) {
 	var currentURL string
-	if err := chromedp.Location(&currentURL).Do(ctx); err != nil {
+	if err := browser.RunInto(ctx, chromedp.Location(), &currentURL); err != nil {
 		return "", err
 	}
 
@@ -279,7 +279,7 @@ func (c *Connector) IsLoggedIn(ctx context.Context) (bool, error) {
 	time.Sleep(2 * time.Second)
 
 	var currentURL string
-	if err := chromedp.Location(&currentURL).Do(browserCtx); err != nil {
+	if err := browser.RunInto(browserCtx, chromedp.Location(), &currentURL); err != nil {
 		return false, nil
 	}
 	return !strings.Contains(currentURL, "login"), nil
@@ -311,7 +311,7 @@ func (c *Connector) GetTransactions(ctx context.Context, opts connector.Transact
 	time.Sleep(3 * time.Second)
 
 	var txHTML string
-	if err := chromedp.InnerHTML("main", &txHTML, chromedp.ByQuery).Do(browserCtx); err != nil {
+	if err := browser.RunInto(browserCtx, chromedp.InnerHTML(chromedp.CSS("main")), &txHTML); err != nil {
 		return nil, fmt.Errorf("revolut: read transactions page: %w", err)
 	}
 

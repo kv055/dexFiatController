@@ -9,9 +9,9 @@ import (
 )
 
 type Config struct {
-	Headless  bool
+	Headless   bool
 	ChromePath string
-	Timeout   time.Duration
+	Timeout    time.Duration
 }
 
 func DefaultConfig() Config {
@@ -65,4 +65,16 @@ func (i *Instance) NewTab(parent context.Context) (context.Context, context.Canc
 
 func (i *Instance) Close() {
 	i.allocCancel()
+}
+
+// RunInto runs a value-returning chromedp action on the tab of ctx and stores
+// the value in dst. It keeps the call sites of the pointer-style API that
+// chromedp had before v0.20 (Title(&s), Location(&s), InnerHTML(sel, &s)).
+func RunInto[T any](ctx context.Context, a chromedp.Action[T], dst *T) error {
+	v, err := chromedp.Run(ctx, a)
+	if err != nil {
+		return err
+	}
+	*dst = v
+	return nil
 }
