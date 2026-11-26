@@ -2,6 +2,7 @@ package auth
 
 import (
 	"bytes"
+	"commons/apierror"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -147,7 +148,7 @@ func (c *TOTPClient) HealthCheck(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("auth/totp: health check failed: HTTP %d", resp.StatusCode)
+		return fmt.Errorf("auth/totp: health check: %w", apierror.FromResponse(resp, "the TOTP service"))
 	}
 	return nil
 }
